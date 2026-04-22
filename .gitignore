@@ -1,0 +1,17 @@
+# macOS
+.DS_Store
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Candy runtime state — never commit (see README "Committed vs Generated Paths")
+plugins/candy/logs/
+plugins/candy/backups/
+plugins/candy/config/.optimizer_phase
+
+# Editor
+.vscode/
+.idea/
+*.swp
