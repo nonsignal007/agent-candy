@@ -298,6 +298,7 @@ jobs/
 - `logs/.limit_until`
 - `config/.optimizer_phase`
 - `backups/`
+- `.candy_cwd/` (candy 실행용 빈 격리 cwd. `claude -p` 가 주변 프로젝트의 `CLAUDE.md` / `.claude/` 설정을 끌어오지 못하도록, `refresh_claude.sh` 가 여기로 `cd` 한 뒤 CLI 를 호출한다.)
 
 주의:
 

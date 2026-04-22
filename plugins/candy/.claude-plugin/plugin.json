@@ -1,7 +1,7 @@
 {
   "name": "candy",
-  "description": "Claude Code 5시간 윈도우를 점심시간 포함해 자동 조정하는 LaunchAgent 번들. 설치 스킬(candy-setup)이 포함되어 있다.",
-  "version": "0.1.0",
+  "description": "Claude Code 5시간 윈도우를 점심시간 포함해 자동 조정하는 LaunchAgent 번들. 설치 스킬(candy-setup) 과 헬스체크/진단 스킬(candy-doctor) 포함.",
+  "version": "0.2.0",
   "author": {
     "name": "nonsignal007",
     "email": "nonsignal007@gmail.com"

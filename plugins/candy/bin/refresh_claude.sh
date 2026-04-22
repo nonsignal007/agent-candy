@@ -120,7 +120,8 @@ fi
 
 # ==================== 메인 로직 ====================
 {
-    mkdir -p "$JOBS_ROOT/empty" && cd "$JOBS_ROOT/empty"
+    # Isolated cwd so `claude -p` doesn't load any project's CLAUDE.md / .claude settings.
+    mkdir -p "$JOBS_ROOT/.candy_cwd" && cd "$JOBS_ROOT/.candy_cwd"
     log "🚀 Claude Code 깨우기 (PID: $$)"
 
 
