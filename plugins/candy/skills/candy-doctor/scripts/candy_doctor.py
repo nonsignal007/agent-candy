@@ -18,6 +18,8 @@ Fix policy (per check, when applicable):
 from __future__ import annotations
 
 import argparse
+import csv
+import datetime
 import json
 import os
 import plistlib
@@ -424,9 +426,10 @@ class Doctor:
                 c.details["extra"] = sorted(extra)
         self.add(c)
 
-        # snapshot alignment: candy - 3 minutes (captures previous window's final,
-        # 2 min before the window reset at the new candy's HH:00). See
-        # bin/schedule_optimizer.sh comment at write_generated_plist call.
+        # snapshot alignment: candy + 297min = HH+4:58 = window_reset - 2min.
+        # Using candy+297 (not next_candy-3) correctly handles the last window of the
+        # day: e.g. candy 21:01 → 01:58, which fires before the 02:00 reset.
+        # next_candy-3 would give 05:58 — after the reset, causing stale-skip.
         c = Check(id="schedule.snapshot.alignment", category="schedule", severity="detail")
         if not candy or not snapshot:
             c.status = "skip"
@@ -436,18 +439,25 @@ class Doctor:
             snap_slots = set(self._start_slots(snapshot))
             expected = set()
             for h, m in candy_slots:
-                tot = h * 60 + m - 3
-                expected.add(((tot // 60) % 24, tot % 60))
+                tot = (h * 60 + m + 297) % 1440
+                expected.add((tot // 60, tot % 60))
             missing = expected - snap_slots
             extra = snap_slots - expected
             if not missing and not extra:
                 c.status = "pass"
-                c.message = "snapshot aligned with candy-3min (final snapshot convention)"
+                c.message = f"snapshot aligned with candy+297min (HH+4:58, 2min before window reset) → {sorted(expected)}"
             else:
                 c.status = "warn"
-                c.message = "snapshot misaligned with candy (expected candy-3min)"
+                c.message = "snapshot misaligned with candy (expected candy+297min = HH+4:58)"
+                c.details["expected"] = sorted(expected)
                 c.details["missing"] = sorted(missing)
                 c.details["extra"] = sorted(extra)
+                c.fix_policy = "confirm"
+                c.fix_command = (
+                    "edit LaunchAgents/com.claude.candy.snapshot.plist: each slot → candy_hour+4:58, "
+                    "then: launchctl bootout gui/$(id -u)/com.claude.candy.snapshot "
+                    "&& launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.claude.candy.snapshot.plist"
+                )
         self.add(c)
 
         # ProgramArguments pattern
@@ -699,6 +709,100 @@ class Doctor:
             c.message = f"could not evaluate optimizer gate: {e}"
         self.add(c)
 
+    def check_optimizer_snap_attribution(self) -> None:
+        """Verify optimizer uses window-start date attribution, not datetime date."""
+        c = Check(id="logic.optimizer_snap_attribution", category="logic", severity="detail")
+        opt_path = self.jobs_root / "bin" / "schedule_optimizer.sh"
+        if not opt_path.exists():
+            c.status = "skip"
+            c.message = "schedule_optimizer.sh not found"
+            self.add(c)
+            return
+
+        text = opt_path.read_text(errors="replace")
+
+        # Old buggy pattern: awk counting snapshots by datetime column
+        old_pattern = re.compile(r"awk.*\$5.*snapshot.*\$2.*~.*d|awk.*snapshot.*\$2~d")
+        # New correct pattern: Python counting via 5h_resets_at - 18000 (window start)
+        new_pattern = re.compile(r"resets_at.*18000|5h_resets_at.*18000")
+
+        if old_pattern.search(text):
+            c.status = "fail"
+            c.message = (
+                "schedule_optimizer.sh snap_count uses awk date-match — "
+                "snapshots crossing midnight are not counted (optimizer stuck at 3/4)"
+            )
+            c.fix_policy = "manual"
+            c.fix_command = (
+                "replace awk snap_count with Python window-start attribution "
+                "(use TARGET_DATE + SNAPSHOT_CSV env vars, count rows where "
+                "datetime.fromtimestamp(int(5h_resets_at)-18000).date() == target)"
+            )
+        elif new_pattern.search(text):
+            c.status = "pass"
+            c.message = "snap_count uses window-start attribution (5h_resets_at - 18000s) ✓"
+        else:
+            c.status = "warn"
+            c.message = "could not detect snap_count method in schedule_optimizer.sh"
+        self.add(c)
+
+    def check_optimizer_window_gate(self) -> None:
+        """Count yesterday's snapshots using window-start attribution and show discrepancy."""
+        c = Check(id="runtime.optimizer_window_gate", category="runtime", severity="detail")
+        p = self.jobs_root / "logs" / "usage_snapshots.csv"
+        if not p.exists():
+            c.status = "skip"
+            c.message = "csv missing"
+            self.add(c)
+            return
+
+        try:
+            today = datetime.date.today()
+            dow = today.weekday()  # 0=Mon
+            if dow == 0:
+                target = today - datetime.timedelta(days=3)  # 월 → 금
+            else:
+                target = today - datetime.timedelta(days=1)
+
+            count_window = 0
+            count_date = 0
+
+            with p.open() as f:
+                for row in csv.DictReader(f):
+                    if row.get("type") != "snapshot":
+                        continue
+                    if row.get("datetime", "").startswith(str(target)):
+                        count_date += 1
+                    try:
+                        resets_at = int(float(row["5h_resets_at"]))
+                        ws = datetime.datetime.fromtimestamp(resets_at - 18000)
+                        if ws.date() == target:
+                            count_window += 1
+                    except (ValueError, KeyError, OSError):
+                        pass
+
+            c.details["target_date"] = str(target)
+            c.details["count_by_window_start"] = count_window
+            c.details["count_by_datetime"] = count_date
+            discrepancy = count_window != count_date
+
+            if count_window >= 4:
+                c.status = "pass"
+                msg = f"window-gate open: {count_window}/4 snapshots for {target}"
+                if discrepancy:
+                    msg += f" (datetime-only would count {count_date} — cross-day window present)"
+                c.message = msg
+            else:
+                c.status = "warn"
+                msg = f"window-gate closed: {count_window}/4 snapshots for {target}"
+                if discrepancy:
+                    msg += f" (datetime-only: {count_date})"
+                c.message = msg
+        except Exception as e:
+            c.status = "warn"
+            c.message = f"could not evaluate window gate: {e}"
+        self.add(c)
+
     # ----- DETAIL: housekeeping -----
 
     def check_log_sizes(self) -> None:
@@ -791,6 +895,8 @@ class Doctor:
         self.check_limit_until()
         self.check_optimizer_tmp_logs()
         self.check_optimizer_gate()
+        self.check_optimizer_snap_attribution()
+        self.check_optimizer_window_gate()
         self.check_log_sizes()
         self.check_notifications()
 
@@ -833,6 +939,7 @@ def render_human(jobs_root: Path, checks: list[Check]) -> str:
         "schedule",
         "config",
         "runtime",
+        "logic",
         "housekeeping",
         "os",
     ]:

@@ -104,12 +104,9 @@ for item in sorted(
     data["StartCalendarInterval"],
     key=lambda entry: (entry.get("Hour", 0), entry.get("Minute", 0)),
 ):
-    minute = item["Minute"]
-    delta = (1 - minute) % 60
-    if delta not in (2, 3):
-        delta = 3
-    total = item["Hour"] * 60 + minute + delta
-    hour = (total // 60) % 24
+    # snapshot = candy + 297min → candy = snapshot - 297min
+    total = (item["Hour"] * 60 + item["Minute"] - 297) % 1440
+    hour = total // 60
     minute = total % 60
     print(f"{hour} {minute}")
 PYEOF
@@ -272,9 +269,15 @@ try:
 except FileNotFoundError:
     exit(0)
 
+def _window_date_str(row):
+    try:
+        return datetime.datetime.fromtimestamp(int(float(row['5h_resets_at'])) - 18000).strftime('%Y-%m-%d')
+    except (ValueError, KeyError, OSError):
+        return ''
+
 rows = [r for r in rows
         if r.get('type') == 'snapshot'
-        and hist_start <= r['datetime'][:10] <= hist_end]
+        and hist_start <= _window_date_str(r) <= hist_end]
 
 if not rows:
     exit(0)
@@ -342,7 +345,13 @@ if today.weekday() == 0:  # 월요일
 else:
     target = today - datetime.timedelta(days=1)  # 어제
 
-recent = [r for r in rows if r['datetime'].startswith(str(target))]
+def _window_date(row):
+    try:
+        return datetime.datetime.fromtimestamp(int(float(row['5h_resets_at'])) - 18000).date()
+    except (ValueError, KeyError, OSError):
+        return None
+
+recent = [r for r in rows if _window_date(r) == target]
 
 if not recent:
     print(f"데이터 없음 (대상 날짜: {target})")
@@ -728,7 +737,23 @@ main() {
 
     local snap_count=0
     if [ -f "$SNAPSHOT_CSV" ]; then
-        snap_count=$(awk -F',' -v d="$target_date" 'NR>1 && $5=="snapshot" && $2~d' "$SNAPSHOT_CSV" | wc -l | tr -d ' ')
+        snap_count=$(TARGET_DATE="$target_date" SNAPSHOT_CSV="$SNAPSHOT_CSV" python3 << 'PYEOF'
+import csv, datetime, os
+target = os.environ["TARGET_DATE"]
+count = 0
+with open(os.environ["SNAPSHOT_CSV"]) as f:
+    for row in csv.DictReader(f):
+        if row.get('type') != 'snapshot':
+            continue
+        try:
+            ws = datetime.datetime.fromtimestamp(int(float(row['5h_resets_at'])) - 18000)
+        except (ValueError, KeyError, OSError):
+            continue
+        if ws.strftime('%Y-%m-%d') == target:
+            count += 1
+print(count)
+PYEOF
+        )
     fi
     log_change "final snapshot: ${snap_count}개 (대상: $target_date, 최소 $MIN_SNAPSHOTS)"
 
@@ -868,9 +893,9 @@ print(', '.join(f'{h:02d}:{m:02d}' for h, m in pairs))
         fi
     fi
 
-    # snapshot plist 생성 (-3분 offset) + 검증
-    # candy :01 → final snapshot을 리셋 2분 전(XX:58)에 두려면 candy 기준 -3분이 필요함
-    if ! write_generated_plist "$SNAP_PLIST_SRC" "com.claude.candy.snapshot" "usage_snapshot.sh" -3 $new_times; then
+    # snapshot plist 생성 (+297분 offset) + 검증
+    # candy HH:01 → final snapshot은 윈도우 리셋 2분 전 HH+4:58 = candy + 4h57m = +297분
+    if ! write_generated_plist "$SNAP_PLIST_SRC" "com.claude.candy.snapshot" "usage_snapshot.sh" 297 $new_times; then
         log_change "WARN: snapshot plist 검증 실패. snapshot은 변경하지 않음."
     else
         safe_copy_plist "$SNAP_PLIST_SRC" "$SNAP_PLIST_SYS"
