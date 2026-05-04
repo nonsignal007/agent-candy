@@ -12,10 +12,7 @@
     </array>
     <key>StartCalendarInterval</key>
     <array>
-        <dict><key>Hour</key><integer>1</integer><key>Minute</key><integer>58</integer></dict>
-        <dict><key>Hour</key><integer>10</integer><key>Minute</key><integer>58</integer></dict>
-        <dict><key>Hour</key><integer>15</integer><key>Minute</key><integer>58</integer></dict>
-        <dict><key>Hour</key><integer>20</integer><key>Minute</key><integer>58</integer></dict>
+        <dict><key>Hour</key><integer>11</integer><key>Minute</key><integer>57</integer></dict>
     </array>
 </dict>
 </plist>

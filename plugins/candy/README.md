@@ -94,19 +94,44 @@ Claude Code의 5시간 윈도우는 한 번 시작되면 고정됩니다.
 
 ## Schedule Rules
 
-Claude의 5시간 윈도우는 분 단위가 아니라 시 단위로 리셋됩니다.
+Claude의 5시간 윈도우는 **분 단위로 정확하게** 리셋됩니다.
 
 ```text
-08:01 실행 -> resetsAt 13:00
-08:30 실행 -> resetsAt 13:00
+08:23 실행 -> resetsAt 13:23
+07:45 실행 -> resetsAt 12:45
 ```
 
-그래서 optimizer는 `HH`만 조정합니다.
+따라서 분 단위 정밀도가 의미를 갖습니다. candy는 다음 두 메커니즘으로 동작합니다.
 
-- candy(윈도우 시작 트리거): 항상 `HH:01`
-- progress: candy 기준 `+59`, `+119`, `+179`, `+239`분
-- final snapshot: 항상 윈도우 리셋 2분 전
-  현재 candy가 `HH:01`이면 final snapshot은 `HH+4:58`
+### 1. 1분 폴러 (poller)
+
+`com.claude.candy.plist`는 `StartInterval=60`으로 설정되어 매 1분마다 `refresh_claude.sh`를 호출합니다. 스크립트는 즉시 gate check를 수행해 실행 시각이 아니면 silent exit합니다.
+
+### 2. 두 개의 상태 파일이 dispatch를 결정
+
+| 파일 | 기록 주체 | 의미 |
+| --- | --- | --- |
+| `config/.candy_morning_ts` | optimizer (23:00) | 다음 아침 pre-warm 시각 (epoch). 이 시각 전엔 절대 실행 안 함 |
+| `config/.candy_next_ts` | candy (성공 후) | 직전 candy의 `resets_at`. 이 시각 이후에 다음 candy 실행 |
+
+### 3. 체인 흐름
+
+```text
+[23:00] optimizer  → .candy_morning_ts = 내일 07:23 epoch 기록 (분 단위)
+[07:23] poller     → gate 통과, candy 실행 → resets_at = 12:23
+                     .candy_morning_ts 삭제, .candy_next_ts = 12:23 기록
+                     snapshot.plist = 12:20, progress.plist = 08:22/09:22/10:22/11:22 동적 갱신
+[12:23] poller     → gate 통과 (next_ts), candy 실행 → resets_at = 17:23
+                     .candy_next_ts = 17:23, snapshot/progress plist 재갱신
+... (체인 반복) ...
+[23:00] optimizer  → 다음 아침 시각으로 morning_ts overwrite
+```
+
+핵심: 첫 아침 시각만 정확히 세팅되면 그 뒤는 `resets_at` 체인으로 자동 전파됩니다.
+
+- candy: 1분 폴러 + state 파일이 결정 (HH:MM 분 단위 정확)
+- progress: candy 시점 기준 `+59/+119/+179/+239`분 (매 candy 실행 시 동적 갱신)
+- final snapshot: `resets_at - 3분` (매 candy 실행 시 동적 갱신)
 
 ## Data Model
 
@@ -175,24 +200,23 @@ Claude의 5시간 윈도우는 분 단위가 아니라 시 단위로 리셋됩�
 
 ## Optimizer Behavior
 
-optimizer는 평일 23:00에 실행됩니다.
+optimizer는 평일 23:00에 실행됩니다. 이전과 달리 **단 하나의 시각(다음 아침 pre-warm `HH:MM`)만 분 단위로 최적화**합니다. 이후 윈도우는 `resets_at` 체인으로 자동 결정됩니다.
 
 - 월요일: 직전 금요일 데이터 사용
 - 화요일-금요일: 어제 데이터 사용
+- 금요일: 다음 주 월요일 아침 시각을 계산
 - 토요일-일요일: 즉시 종료
 
 안전장치:
 
-- final `snapshot`이 최소 4개 미만이면 스케줄을 바꾸지 않음
-- 현재 스케줄과 계산 결과가 같으면 변경 안 함
-- 시간 변경폭은 최대 2시간으로 제한
-- 생성된 plist는 구조 검증 후에만 교체
-- candy plist가 깨졌으면 snapshot plist에서 candy 시각 역산 가능
+- final `snapshot`이 최소 3개 미만이면 변경 안 함 (`MIN_SNAPSHOTS`)
+- 시간 변경폭은 최대 120분(분 단위) (`MAX_SHIFT_MIN`)
+- Claude 응답 파싱 실패 시 morning_ts 변경 없음
 
-중요:
+출력:
 
-- 최소 데이터 판정은 여전히 final `snapshot` 기준입니다.
-- `progress`는 판단 근거를 풍부하게 하지만, gate를 완화하지는 않습니다.
+- optimizer는 plist를 직접 수정하지 않습니다. **`.candy_morning_ts`에 다음 아침 epoch만 기록**합니다.
+- snapshot/progress plist는 candy 실행 시 동적으로 재생성됩니다.
 
 ### Lunch Rotation and Friday Branch
 
@@ -408,16 +432,26 @@ launchctl print gui/$(id -u)/com.claude.candy.optimizer
 
 ## Operations
 
-### Check current schedule
+### Check current chain state
+
+candy는 1분 폴러로 동작하므로 candy.plist의 시간을 확인하는 대신 상태 파일을 봅니다.
 
 ```bash
+# 다음 candy 시각 (체인)
+ts=$(cat ~/jobs/config/.candy_next_ts 2>/dev/null) && python3 -c "import datetime; print('next:', datetime.datetime.fromtimestamp($ts))"
+
+# 다음 아침 pre-warm 시각 (optimizer가 23:00에 갱신)
+ts=$(cat ~/jobs/config/.candy_morning_ts 2>/dev/null) && python3 -c "import datetime; print('morning:', datetime.datetime.fromtimestamp($ts))"
+
+# 현재 적용 중인 snapshot/progress 시각
 python3 - <<'PY'
 import os, plistlib
-path = os.path.expanduser('~/jobs/LaunchAgents/com.claude.candy.plist')
-with open(path, 'rb') as f:
-    data = plistlib.load(f)
-for item in data['StartCalendarInterval']:
-    print(f"{item['Hour']:02d}:{item['Minute']:02d}")
+for name in ['snapshot', 'progress']:
+    path = os.path.expanduser(f'~/jobs/LaunchAgents/com.claude.candy.{name}.plist')
+    with open(path, 'rb') as f:
+        data = plistlib.load(f)
+    slots = [(i['Hour'], i['Minute']) for i in data.get('StartCalendarInterval', [])]
+    print(f"{name}: {slots}")
 PY
 ```
 
@@ -574,9 +608,10 @@ bash tests/live_claude_optimizer_smoke.sh
 
 | Setting | Default |
 | --- | --- |
-| `MIN_SNAPSHOTS` | `4` |
-| `MAX_HOUR_SHIFT` | `2` |
+| `MIN_SNAPSHOTS` | `3` |
+| `MAX_SHIFT_MIN` | `120` (분) |
 | `MAX_CSV_LINES` | `500` |
-| candy slots | 4 per weekday |
-| progress slots | 16 per weekday |
-| final snapshot slots | 4 per weekday |
+| candy LaunchAgent | `StartInterval=60s` (1분 폴러) |
+| snapshot slots | 1 (resets_at - 3min, 동적 갱신) |
+| progress slots | 4 (candy + 1h/2h/3h/4h, 동적 갱신) |
+| optimizer slots | 1 (평일 23:00) |

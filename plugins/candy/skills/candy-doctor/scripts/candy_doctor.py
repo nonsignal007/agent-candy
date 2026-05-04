@@ -328,43 +328,28 @@ class Doctor:
         snapshot = self._load_plist("com.claude.candy.snapshot")
         optimizer = self._load_plist("com.claude.candy.optimizer")
 
-        # candy slot shape: 4 weekday slots, all minute=01
-        c = Check(id="schedule.candy.shape", category="schedule", severity="detail")
+        # candy: 1분 폴러 (StartInterval=60). dispatch는 .candy_next_ts/.candy_morning_ts로 결정됨
+        c = Check(id="schedule.candy.poller", category="schedule", severity="detail")
         if not candy:
             c.status = "skip"
             c.message = "candy plist missing"
         else:
-            slots = self._start_slots(candy)
-            c.details["slots"] = slots
-            bad = [s for s in slots if s[1] != 1]
-            if len(slots) != 4:
-                c.status = "warn"
-                c.message = f"candy has {len(slots)} slots, expected 4"
-            elif bad:
-                c.status = "warn"
-                c.message = f"candy slots with minute != 01: {bad}"
-            else:
+            interval = candy.get("StartInterval")
+            cal = candy.get("StartCalendarInterval")
+            if isinstance(interval, int) and 30 <= interval <= 120:
                 c.status = "pass"
-                c.message = f"candy: 4 slots, all HH:01 → {slots}"
+                c.message = f"candy: poller mode (StartInterval={interval}s)"
+            elif cal:
+                c.status = "warn"
+                c.message = "candy still uses legacy StartCalendarInterval — should be StartInterval=60 (poller)"
+                c.fix_policy = "confirm"
+                c.fix_command = "run /candy-setup to update plist to poller mode"
+            else:
+                c.status = "warn"
+                c.message = f"candy plist has neither StartInterval nor StartCalendarInterval"
         self.add(c)
 
-        # progress: should be 16 slots, aligned at candy + 59/119/179/239
-        c = Check(id="schedule.progress.shape", category="schedule", severity="detail")
-        if not progress:
-            c.status = "skip"
-            c.message = "progress plist missing"
-        else:
-            pslots = self._start_slots(progress)
-            c.details["slots"] = pslots
-            if len(pslots) != 16:
-                c.status = "warn"
-                c.message = f"progress has {len(pslots)} slots, expected 16 (4 candy × 4)"
-            else:
-                c.status = "pass"
-                c.message = "progress: 16 slots"
-        self.add(c)
-
-        # snapshot: 4 slots, at candy_hour+4, minute=58
+        # snapshot: 동적 단일 entry (resets_at - 3min). candy 첫 실행 전엔 비어있을 수 있음
         c = Check(id="schedule.snapshot.shape", category="schedule", severity="detail")
         if not snapshot:
             c.status = "skip"
@@ -372,16 +357,34 @@ class Doctor:
         else:
             sslots = self._start_slots(snapshot)
             c.details["slots"] = sslots
-            bad_min = [s for s in sslots if s[1] != 58]
-            if len(sslots) != 4:
-                c.status = "warn"
-                c.message = f"snapshot has {len(sslots)} slots, expected 4"
-            elif bad_min:
-                c.status = "warn"
-                c.message = f"snapshot slots with minute != 58: {bad_min}"
-            else:
+            if len(sslots) == 1:
                 c.status = "pass"
-                c.message = f"snapshot: 4 slots at HH:58 → {sslots}"
+                c.message = f"snapshot: 1 dynamic slot (resets_at - 3min) → {sslots}"
+            elif len(sslots) == 0:
+                c.status = "pass"
+                c.message = "snapshot: 0 slots (will be set by first candy run)"
+            else:
+                c.status = "warn"
+                c.message = f"snapshot has {len(sslots)} slots, expected 1 (dynamic)"
+        self.add(c)
+
+        # progress: 동적 4 entries (candy + 59/119/179/239min)
+        c = Check(id="schedule.progress.shape", category="schedule", severity="detail")
+        if not progress:
+            c.status = "skip"
+            c.message = "progress plist missing"
+        else:
+            pslots = self._start_slots(progress)
+            c.details["slots"] = pslots
+            if len(pslots) == 4:
+                c.status = "pass"
+                c.message = f"progress: 4 dynamic slots (candy + 1h/2h/3h/4h)"
+            elif len(pslots) == 0:
+                c.status = "pass"
+                c.message = "progress: 0 slots (will be set by first candy run)"
+            else:
+                c.status = "warn"
+                c.message = f"progress has {len(pslots)} slots, expected 4 (dynamic)"
         self.add(c)
 
         # optimizer: 1 slot at 23:00, weekday only (weekday check is in plist via Weekday key)
@@ -399,65 +402,6 @@ class Doctor:
             else:
                 c.status = "warn"
                 c.message = f"optimizer slots unusual: {oslots}"
-        self.add(c)
-
-        # progress alignment with candy: for each candy slot, expect candy+59, +119, +179, +239 min
-        c = Check(id="schedule.progress.alignment", category="schedule", severity="detail")
-        if not candy or not progress:
-            c.status = "skip"
-            c.message = "candy or progress plist missing"
-        else:
-            candy_slots = self._start_slots(candy)
-            progress_slots = set(self._start_slots(progress))
-            expected = set()
-            for h, m in candy_slots:
-                for delta in (59, 119, 179, 239):
-                    tot = h * 60 + m + delta
-                    expected.add(((tot // 60) % 24, tot % 60))
-            missing = expected - progress_slots
-            extra = progress_slots - expected
-            if not missing and not extra:
-                c.status = "pass"
-                c.message = "progress perfectly aligned with candy (+59/+119/+179/+239)"
-            else:
-                c.status = "warn"
-                c.message = "progress misaligned with candy"
-                c.details["missing"] = sorted(missing)
-                c.details["extra"] = sorted(extra)
-        self.add(c)
-
-        # snapshot alignment: candy + 297min = HH+4:58 = window_reset - 2min.
-        # Using candy+297 (not next_candy-3) correctly handles the last window of the
-        # day: e.g. candy 21:01 → 01:58, which fires before the 02:00 reset.
-        # next_candy-3 would give 05:58 — after the reset, causing stale-skip.
-        c = Check(id="schedule.snapshot.alignment", category="schedule", severity="detail")
-        if not candy or not snapshot:
-            c.status = "skip"
-            c.message = "candy or snapshot plist missing"
-        else:
-            candy_slots = self._start_slots(candy)
-            snap_slots = set(self._start_slots(snapshot))
-            expected = set()
-            for h, m in candy_slots:
-                tot = (h * 60 + m + 297) % 1440
-                expected.add((tot // 60, tot % 60))
-            missing = expected - snap_slots
-            extra = snap_slots - expected
-            if not missing and not extra:
-                c.status = "pass"
-                c.message = f"snapshot aligned with candy+297min (HH+4:58, 2min before window reset) → {sorted(expected)}"
-            else:
-                c.status = "warn"
-                c.message = "snapshot misaligned with candy (expected candy+297min = HH+4:58)"
-                c.details["expected"] = sorted(expected)
-                c.details["missing"] = sorted(missing)
-                c.details["extra"] = sorted(extra)
-                c.fix_policy = "confirm"
-                c.fix_command = (
-                    "edit LaunchAgents/com.claude.candy.snapshot.plist: each slot → candy_hour+4:58, "
-                    "then: launchctl bootout gui/$(id -u)/com.claude.candy.snapshot "
-                    "&& launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.claude.candy.snapshot.plist"
-                )
         self.add(c)
 
         # ProgramArguments pattern
@@ -537,6 +481,55 @@ class Doctor:
         else:
             c.status = "warn"
             c.message = f".optimizer_phase has unexpected contents: {text[:80]!r}"
+        self.add(c)
+
+    def check_chain_state(self) -> None:
+        """분 단위 체인용 상태 파일 점검: .candy_morning_ts / .candy_next_ts"""
+        morning_p = self.jobs_root / "config" / ".candy_morning_ts"
+        next_p = self.jobs_root / "config" / ".candy_next_ts"
+        now = int(time.time())
+
+        # morning gate (optimizer가 다음 아침 시각을 기록)
+        c = Check(id="state.candy_morning_ts", category="config", severity="detail")
+        if not morning_p.exists():
+            c.status = "pass"
+            c.message = ".candy_morning_ts absent (chain mode without morning gate)"
+        else:
+            try:
+                ts = int(morning_p.read_text().strip())
+                c.details["ts"] = ts
+                c.details["age_seconds"] = now - ts
+                if ts > now:
+                    c.status = "pass"
+                    c.message = f".candy_morning_ts: 다음 아침까지 {(ts - now)//60}분 남음"
+                else:
+                    # past: 정상 (candy가 사용 후 삭제 못 한 경우 등)
+                    c.status = "pass"
+                    c.message = f".candy_morning_ts: 과거 시각 (사용됐거나 stale, age {(now - ts)//60}min)"
+            except Exception as e:
+                c.status = "warn"
+                c.message = f".candy_morning_ts unreadable: {e}"
+        self.add(c)
+
+        # chain 시각 (이전 candy의 resets_at)
+        c = Check(id="state.candy_next_ts", category="config", severity="detail")
+        if not next_p.exists():
+            c.status = "pass"
+            c.message = ".candy_next_ts absent (체인 미시작)"
+        else:
+            try:
+                ts = int(next_p.read_text().strip())
+                c.details["ts"] = ts
+                c.details["age_seconds"] = now - ts
+                if ts > now:
+                    c.status = "pass"
+                    c.message = f".candy_next_ts: 다음 chain까지 {(ts - now)//60}분 남음"
+                else:
+                    c.status = "pass"
+                    c.message = f".candy_next_ts: 과거 (candy가 곧 실행될 예정, age {(now - ts)//60}min)"
+            except Exception as e:
+                c.status = "warn"
+                c.message = f".candy_next_ts unreadable: {e}"
         self.add(c)
 
     # ----- DETAIL: runtime state -----
@@ -889,6 +882,7 @@ class Doctor:
         self.check_schedule()
         self.check_lunch_conf()
         self.check_optimizer_phase()
+        self.check_chain_state()
         self.check_rate_limit_file()
         self.check_refresh_log()
         self.check_usage_csv()

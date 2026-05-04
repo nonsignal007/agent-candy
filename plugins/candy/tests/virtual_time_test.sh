@@ -15,6 +15,8 @@ copy_repo() {
     rm -rf "$TMP_HOME/jobs/logs"
     mkdir -p "$TMP_HOME/jobs/logs" "$TMP_HOME/.claude" "$TMP_HOME/.local/bin" "$TMP_HOME/Library/LaunchAgents"
     rm -f "$TMP_HOME/jobs/config/.optimizer_phase"
+    rm -f "$TMP_HOME/jobs/config/.candy_morning_ts"
+    rm -f "$TMP_HOME/jobs/config/.candy_next_ts"
 }
 
 write_fake_commands() {
@@ -87,7 +89,23 @@ EOF
 assert_file_contains() {
     local file="$1" pattern="$2"
     if ! grep -q "$pattern" "$file"; then
-        echo "assertion failed: expected $file to contain $pattern" >&2
+        echo "assertion failed: expected $file to contain '$pattern'" >&2
+        exit 1
+    fi
+}
+
+assert_file_not_exists() {
+    local file="$1"
+    if [ -f "$file" ]; then
+        echo "assertion failed: $file should not exist" >&2
+        exit 1
+    fi
+}
+
+assert_file_exists() {
+    local file="$1"
+    if [ ! -f "$file" ]; then
+        echo "assertion failed: $file should exist" >&2
         exit 1
     fi
 }
@@ -118,7 +136,7 @@ scenario_progress_and_final() {
     run_job_script "$(ts_of "2026-04-21T11:00:00")" bash "$TMP_HOME/jobs/bin/usage_progress.sh"
     run_job_script "$(ts_of "2026-04-21T12:00:00")" bash "$TMP_HOME/jobs/bin/usage_progress.sh"
     run_job_script "$(ts_of "2026-04-21T13:00:00")" bash "$TMP_HOME/jobs/bin/usage_progress.sh"
-    run_job_script "$(ts_of "2026-04-21T13:58:00")" bash "$TMP_HOME/jobs/bin/usage_snapshot.sh"
+    run_job_script "$(ts_of "2026-04-21T13:57:00")" bash "$TMP_HOME/jobs/bin/usage_snapshot.sh"
 
     assert_csv_value "$TMP_HOME/jobs/logs/usage_snapshots.csv" "len(rows) == 5"
     assert_csv_value "$TMP_HOME/jobs/logs/usage_snapshots.csv" "[r['sample_slot'] for r in rows] == ['1h', '2h', '3h', '4h', 'final']"
@@ -157,68 +175,167 @@ hit your limit
 EOF
 
     run_job_script "$(ts_of "2026-04-21T13:00:00")" bash "$TMP_HOME/jobs/bin/usage_progress.sh"
-    run_job_script "$(ts_of "2026-04-21T13:58:00")" bash "$TMP_HOME/jobs/bin/usage_snapshot.sh"
+    run_job_script "$(ts_of "2026-04-21T13:57:00")" bash "$TMP_HOME/jobs/bin/usage_snapshot.sh"
 
     assert_csv_value "$TMP_HOME/jobs/logs/usage_snapshots.csv" "all(r['effective_5h_used_pct'] == '100' for r in rows)"
     assert_csv_value "$TMP_HOME/jobs/logs/usage_snapshots.csv" "all(r['progress_source'] == 'limit_carry' for r in rows)"
     assert_csv_value "$TMP_HOME/jobs/logs/usage_snapshots.csv" "all(r['limit_hit_at'] == rows[0]['limit_hit_at'] for r in rows)"
 }
 
-scenario_optimizer_skip_and_update() {
+# optimizer가 데이터 부족 시 skip하고, 충분한 데이터와 valid 응답으로 .candy_morning_ts를 기록하는지 검증
+scenario_optimizer_morning_ts() {
     copy_repo
     write_fake_commands
 
-    local target_date fake_now
-    fake_now=$(ts_of "2026-04-21T23:00:00")
-    target_date="2026-04-20"
+    local fake_now target_date
+    fake_now=$(ts_of "2026-04-21T23:00:00")  # 화요일 23:00 (DOW=2)
+    target_date="2026-04-20"                   # 어제 = 월요일
 
-    append_csv_row "{\"timestamp\": 1776650400, \"datetime\": \"$target_date 10:58:00\", \"dow\": 0, \"hour\": 10, \"type\": \"snapshot\", \"sample_slot\": \"final\", \"5h_used_pct\": 40, \"5h_resets_at\": 1776657600}"
-    append_csv_row "{\"timestamp\": 1776668400, \"datetime\": \"$target_date 15:58:00\", \"dow\": 0, \"hour\": 15, \"type\": \"snapshot\", \"sample_slot\": \"final\", \"5h_used_pct\": 65, \"5h_resets_at\": 1776675600}"
-    append_csv_row "{\"timestamp\": 1776686400, \"datetime\": \"$target_date 20:58:00\", \"dow\": 0, \"hour\": 20, \"type\": \"snapshot\", \"sample_slot\": \"final\", \"5h_used_pct\": 72, \"5h_resets_at\": 1776693600}"
+    # 2개 snapshot (MIN_SNAPSHOTS=3 미만 → skip 확인)
+    append_csv_row "{\"timestamp\":1776650400,\"datetime\":\"$target_date 10:58:00\",\"dow\":0,\"hour\":10,\"type\":\"snapshot\",\"sample_slot\":\"final\",\"5h_used_pct\":40,\"5h_resets_at\":1776657600,\"effective_5h_used_pct\":40,\"progress_source\":\"raw\"}"
+    append_csv_row "{\"timestamp\":1776668400,\"datetime\":\"$target_date 15:58:00\",\"dow\":0,\"hour\":15,\"type\":\"snapshot\",\"sample_slot\":\"final\",\"5h_used_pct\":65,\"5h_resets_at\":1776675600,\"effective_5h_used_pct\":65,\"progress_source\":\"raw\"}"
 
     run_job_script "$fake_now" bash "$TMP_HOME/jobs/bin/schedule_optimizer.sh" >/dev/null
-    [ ! -f "$TMP_HOME/jobs/logs/fake_claude.log" ]
+    assert_file_not_exists "$TMP_HOME/jobs/logs/fake_claude.log"
 
+    # 3번째 row 추가 → 3개 = MIN_SNAPSHOTS → proceed
+    append_csv_row "{\"timestamp\":1776686400,\"datetime\":\"$target_date 20:58:00\",\"dow\":0,\"hour\":20,\"type\":\"snapshot\",\"sample_slot\":\"final\",\"5h_used_pct\":72,\"5h_resets_at\":1776693600,\"effective_5h_used_pct\":72,\"progress_source\":\"raw\"}"
+
+    # FAKE_CLAUDE_FILE: time=[7,45] 응답 (retry sleep 없이 바로 성공)
+    cat > "$TMP_HOME/jobs/logs/fake_claude_response.ndjson" <<'RESP'
+{"type":"result","result":"{\"time\": [7, 45], \"reason\": \"점심 12:45 종료 기준 07:45 pre-warm.\"}"}
+RESP
+
+    # FAKE_CLAUDE_FILE은 shell function prefix로 전달하면 자식 프로세스에 export 안 됨 → 직접 호출
+    HOME="$TMP_HOME" JOBS_ROOT="$TMP_HOME/jobs" PLIST_SYS_DIR="$TMP_HOME/Library/LaunchAgents" \
+        TOOLS_BIN_DIR="$TMP_HOME/.local/bin" FAKE_NOW_TS="$fake_now" TEST_MODE=1 \
+        FAKE_CLAUDE_FILE="$TMP_HOME/jobs/logs/fake_claude_response.ndjson" \
+        bash "$TMP_HOME/jobs/bin/schedule_optimizer.sh" >/dev/null
+
+    # .candy_morning_ts 파일이 생성되어야 함
+    assert_file_exists "$TMP_HOME/jobs/config/.candy_morning_ts"
+
+    # ts가 내일(2026-04-22) 07:45에 해당해야 함
+    PYTHONPATH="$TMP_HOME/jobs/bin/lib" python3 - "$TMP_HOME/jobs/config/.candy_morning_ts" <<'PYEOF'
+import datetime, sys
+
+with open(sys.argv[1]) as f:
+    ts = int(f.read().strip())
+dt = datetime.datetime.fromtimestamp(ts)
+expected = datetime.datetime(2026, 4, 22, 7, 45)
+assert dt == expected, f"expected {expected}, got {dt}"
+PYEOF
+}
+
+# gate: morning_ts가 미래이면 refresh_claude.sh가 silent skip
+scenario_gate_morning_blocks() {
     copy_repo
     write_fake_commands
 
-    append_csv_row "{\"timestamp\": 1776649200, \"datetime\": \"$target_date 08:00:00\", \"dow\": 0, \"hour\": 8, \"type\": \"progress\", \"sample_slot\": \"1h\", \"5h_used_pct\": 20, \"effective_5h_used_pct\": 20, \"5h_resets_at\": 1776657600, \"progress_source\": \"raw\"}"
-    append_csv_row "{\"timestamp\": 1776652800, \"datetime\": \"$target_date 09:00:00\", \"dow\": 0, \"hour\": 9, \"type\": \"progress\", \"sample_slot\": \"2h\", \"5h_used_pct\": 44, \"effective_5h_used_pct\": 44, \"5h_resets_at\": 1776657600, \"progress_source\": \"raw\"}"
-    append_csv_row "{\"timestamp\": 1776656400, \"datetime\": \"$target_date 10:00:00\", \"dow\": 0, \"hour\": 10, \"type\": \"progress\", \"sample_slot\": \"3h\", \"5h_used_pct\": 78, \"effective_5h_used_pct\": 78, \"5h_resets_at\": 1776657600, \"progress_source\": \"raw\"}"
-    append_csv_row "{\"timestamp\": 1776660000, \"datetime\": \"$target_date 11:00:00\", \"dow\": 0, \"hour\": 11, \"type\": \"progress\", \"sample_slot\": \"4h\", \"5h_used_pct\": 95, \"effective_5h_used_pct\": 95, \"5h_resets_at\": 1776657600, \"progress_source\": \"raw\"}"
-    append_csv_row "{\"timestamp\": 1776663480, \"datetime\": \"$target_date 11:58:00\", \"dow\": 0, \"hour\": 11, \"type\": \"snapshot\", \"sample_slot\": \"final\", \"5h_used_pct\": 99, \"effective_5h_used_pct\": 99, \"5h_resets_at\": 1776657600, \"progress_source\": \"raw\"}"
-    append_csv_row "{\"timestamp\": 1776667200, \"datetime\": \"$target_date 13:00:00\", \"dow\": 0, \"hour\": 13, \"type\": \"progress\", \"sample_slot\": \"1h\", \"5h_used_pct\": 18, \"effective_5h_used_pct\": 18, \"5h_resets_at\": 1776675600, \"progress_source\": \"raw\"}"
-    append_csv_row "{\"timestamp\": 1776670800, \"datetime\": \"$target_date 14:00:00\", \"dow\": 0, \"hour\": 14, \"type\": \"progress\", \"sample_slot\": \"2h\", \"5h_used_pct\": 36, \"effective_5h_used_pct\": 36, \"5h_resets_at\": 1776675600, \"progress_source\": \"raw\"}"
-    append_csv_row "{\"timestamp\": 1776674400, \"datetime\": \"$target_date 15:00:00\", \"dow\": 0, \"hour\": 15, \"type\": \"progress\", \"sample_slot\": \"3h\", \"5h_used_pct\": 61, \"effective_5h_used_pct\": 61, \"5h_resets_at\": 1776675600, \"progress_source\": \"raw\"}"
-    append_csv_row "{\"timestamp\": 1776678000, \"datetime\": \"$target_date 16:00:00\", \"dow\": 0, \"hour\": 16, \"type\": \"progress\", \"sample_slot\": \"4h\", \"5h_used_pct\": 85, \"effective_5h_used_pct\": 85, \"5h_resets_at\": 1776675600, \"progress_source\": \"raw\"}"
-    append_csv_row "{\"timestamp\": 1776681480, \"datetime\": \"$target_date 16:58:00\", \"dow\": 0, \"hour\": 16, \"type\": \"snapshot\", \"sample_slot\": \"final\", \"5h_used_pct\": 92, \"effective_5h_used_pct\": 92, \"5h_resets_at\": 1776675600, \"progress_source\": \"raw\"}"
-    append_csv_row "{\"timestamp\": 1776685200, \"datetime\": \"$target_date 18:00:00\", \"dow\": 0, \"hour\": 18, \"type\": \"progress\", \"sample_slot\": \"1h\", \"5h_used_pct\": 15, \"effective_5h_used_pct\": 15, \"5h_resets_at\": 1776693600, \"progress_source\": \"raw\"}"
-    append_csv_row "{\"timestamp\": 1776688800, \"datetime\": \"$target_date 19:00:00\", \"dow\": 0, \"hour\": 19, \"type\": \"progress\", \"sample_slot\": \"2h\", \"5h_used_pct\": 33, \"effective_5h_used_pct\": 33, \"5h_resets_at\": 1776693600, \"progress_source\": \"raw\"}"
-    append_csv_row "{\"timestamp\": 1776692400, \"datetime\": \"$target_date 20:00:00\", \"dow\": 0, \"hour\": 20, \"type\": \"progress\", \"sample_slot\": \"3h\", \"5h_used_pct\": 57, \"effective_5h_used_pct\": 57, \"5h_resets_at\": 1776693600, \"progress_source\": \"raw\"}"
-    append_csv_row "{\"timestamp\": 1776696000, \"datetime\": \"$target_date 21:00:00\", \"dow\": 0, \"hour\": 21, \"type\": \"progress\", \"sample_slot\": \"4h\", \"5h_used_pct\": 88, \"effective_5h_used_pct\": 88, \"5h_resets_at\": 1776693600, \"progress_source\": \"raw\"}"
-    append_csv_row "{\"timestamp\": 1776699480, \"datetime\": \"$target_date 21:58:00\", \"dow\": 0, \"hour\": 21, \"type\": \"snapshot\", \"sample_slot\": \"final\", \"5h_used_pct\": 94, \"effective_5h_used_pct\": 94, \"5h_resets_at\": 1776693600, \"progress_source\": \"raw\"}"
-    append_csv_row "{\"timestamp\": 1776703200, \"datetime\": \"$target_date 23:00:00\", \"dow\": 0, \"hour\": 23, \"type\": \"progress\", \"sample_slot\": \"1h\", \"5h_used_pct\": 12, \"effective_5h_used_pct\": 12, \"5h_resets_at\": 1776711600, \"progress_source\": \"raw\"}"
-    append_csv_row "{\"timestamp\": 1776706800, \"datetime\": \"$target_date 23:58:00\", \"dow\": 0, \"hour\": 23, \"type\": \"snapshot\", \"sample_slot\": \"final\", \"5h_used_pct\": 48, \"effective_5h_used_pct\": 48, \"5h_resets_at\": 1776711600, \"progress_source\": \"raw\"}"
+    # morning_ts = 오늘 07:23 (현재 05:00보다 미래)
+    local fake_now morning_ts
+    fake_now=$(ts_of "2026-04-21T05:00:00")
+    morning_ts=$(ts_of "2026-04-21T07:23:00")
+    mkdir -p "$TMP_HOME/jobs/config"
+    echo "$morning_ts" > "$TMP_HOME/jobs/config/.candy_morning_ts"
 
-    cat > "$TMP_HOME/jobs/logs/fake_claude_response.ndjson" <<'EOF'
-{"type":"result","result":"{\"times\": [[7, 1], [12, 1], [17, 1], [22, 1]], \"reason\": \"오후 보호를 위해 한 시간씩 뒤로 민다.\"}"}
-EOF
+    run_job_script "$fake_now" bash "$TMP_HOME/jobs/bin/refresh_claude.sh" >/dev/null
+    assert_file_not_exists "$TMP_HOME/jobs/logs/fake_claude.log"
+}
 
-    HOME="$TMP_HOME" FAKE_NOW_TS="$fake_now" TEST_MODE=1 FAKE_CLAUDE_FILE="$TMP_HOME/jobs/logs/fake_claude_response.ndjson" \
-        bash "$TMP_HOME/jobs/bin/schedule_optimizer.sh" >/dev/null
+# gate: next_ts가 미래이면 refresh_claude.sh가 silent skip
+scenario_gate_next_ts_blocks() {
+    copy_repo
+    write_fake_commands
 
-    assert_file_contains "$TMP_HOME/jobs/logs/fake_launchctl.log" "com.claude.candy.progress"
-    assert_file_contains "$TMP_HOME/jobs/logs/fake_launchctl.log" "com.claude.candy.snapshot"
-    assert_file_contains "$TMP_HOME/jobs/logs/fake_launchctl.log" "com.claude.candy"
-    assert_file_contains "$TMP_HOME/jobs/LaunchAgents/com.claude.candy.snapshot.plist" "<integer>6</integer><key>Minute</key><integer>58</integer>"
-    assert_file_contains "$TMP_HOME/jobs/LaunchAgents/com.claude.candy.progress.plist" "<integer>8</integer><key>Minute</key><integer>0</integer>"
+    local fake_now next_ts
+    fake_now=$(ts_of "2026-04-21T10:00:00")
+    next_ts=$(ts_of "2026-04-21T11:00:00")  # 미래
+    mkdir -p "$TMP_HOME/jobs/config"
+    echo "$next_ts" > "$TMP_HOME/jobs/config/.candy_next_ts"
+
+    run_job_script "$fake_now" bash "$TMP_HOME/jobs/bin/refresh_claude.sh" >/dev/null
+    assert_file_not_exists "$TMP_HOME/jobs/logs/fake_claude.log"
+}
+
+# gate: next_ts가 과거이고 morning_ts 없으면 candy 실행 + 체인 갱신 검증
+scenario_gate_proceeds_when_past() {
+    copy_repo
+    write_fake_commands
+
+    local fake_now past_ts resets_at
+    fake_now=$(ts_of "2026-04-21T07:23:00")
+    past_ts=$(ts_of "2026-04-21T06:00:00")
+    resets_at=$(ts_of "2026-04-21T12:23:00")
+    mkdir -p "$TMP_HOME/jobs/config"
+    echo "$past_ts" > "$TMP_HOME/jobs/config/.candy_next_ts"
+
+    # rate_limit_event 포함 응답으로 chain 갱신 경로 활성화
+    cat > "$TMP_HOME/jobs/logs/fake_claude_response.ndjson" <<RESP
+{"type":"result","result":"ok"}
+{"type":"rate_limit_event","rate_limit_info":{"resetsAt":$resets_at}}
+RESP
+
+    HOME="$TMP_HOME" JOBS_ROOT="$TMP_HOME/jobs" PLIST_SYS_DIR="$TMP_HOME/Library/LaunchAgents" \
+        TOOLS_BIN_DIR="$TMP_HOME/.local/bin" FAKE_NOW_TS="$fake_now" TEST_MODE=1 \
+        FAKE_CLAUDE_FILE="$TMP_HOME/jobs/logs/fake_claude_response.ndjson" \
+        bash "$TMP_HOME/jobs/bin/refresh_claude.sh" >/dev/null
+
+    # gate를 통과해 claude가 호출되어야 함
+    assert_file_exists "$TMP_HOME/jobs/logs/fake_claude.log"
+
+    # .candy_next_ts가 resets_at으로 갱신되었는지
+    local next_recorded
+    next_recorded=$(cat "$TMP_HOME/jobs/config/.candy_next_ts" 2>/dev/null || echo "")
+    [ "$next_recorded" = "$resets_at" ] || {
+        echo "assertion failed: .candy_next_ts=$next_recorded, expected=$resets_at" >&2
+        exit 1
+    }
+
+    # snapshot.plist에 resets_at - 3min(=12:20) 단일 entry 존재
+    PLIST_PATH="$TMP_HOME/jobs/LaunchAgents/com.claude.candy.snapshot.plist" python3 <<'PYEOF'
+import os, plistlib
+with open(os.environ["PLIST_PATH"], "rb") as f:
+    data = plistlib.load(f)
+slots = [(i["Hour"], i["Minute"]) for i in data.get("StartCalendarInterval", [])]
+assert slots == [(12, 20)], f"snapshot expected [(12, 20)], got {slots}"
+PYEOF
+
+    # progress.plist에 candy(07:23) + 59/119/179/239min = 08:22 / 09:22 / 10:22 / 11:22
+    PLIST_PATH="$TMP_HOME/jobs/LaunchAgents/com.claude.candy.progress.plist" python3 <<'PYEOF'
+import os, plistlib
+with open(os.environ["PLIST_PATH"], "rb") as f:
+    data = plistlib.load(f)
+slots = sorted((i["Hour"], i["Minute"]) for i in data.get("StartCalendarInterval", []))
+expected = [(8, 22), (9, 22), (10, 22), (11, 22)]
+assert slots == expected, f"progress expected {expected}, got {slots}"
+PYEOF
+}
+
+# quiet hours: 23:00~04:59 사이엔 silent skip
+scenario_quiet_hours_blocks() {
+    copy_repo
+    write_fake_commands
+
+    local fake_now
+    fake_now=$(ts_of "2026-04-21T03:30:00")  # 새벽
+    mkdir -p "$TMP_HOME/jobs/config"
+    # next_ts는 과거 (gate는 통과해야 하지만 quiet hours가 막음)
+    echo "$(ts_of "2026-04-21T03:00:00")" > "$TMP_HOME/jobs/config/.candy_next_ts"
+
+    run_job_script "$fake_now" bash "$TMP_HOME/jobs/bin/refresh_claude.sh" >/dev/null
+    assert_file_not_exists "$TMP_HOME/jobs/logs/fake_claude.log"
 }
 
 main() {
     scenario_progress_and_final
     scenario_stale_and_weekend
     scenario_limit_carry
-    scenario_optimizer_skip_and_update
+    scenario_optimizer_morning_ts
+    scenario_gate_morning_blocks
+    scenario_gate_next_ts_blocks
+    scenario_gate_proceeds_when_past
+    scenario_quiet_hours_blocks
     echo "virtual_time_test.sh: ok"
 }
 

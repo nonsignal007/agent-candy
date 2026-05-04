@@ -16,3 +16,5 @@ plugins/candy/.candy_cwd/
 .vscode/
 .idea/
 *.swp
+.omx/
+.omc/

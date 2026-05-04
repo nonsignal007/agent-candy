@@ -144,8 +144,11 @@ for name in (
     path = os.path.join(home, "jobs", "LaunchAgents", name)
     with open(path, "rb") as f:
         data = plistlib.load(f)
-    times = [(item["Hour"], item["Minute"]) for item in data["StartCalendarInterval"]]
-    print(name, times)
+    if "StartInterval" in data:
+        print(name, f"StartInterval={data['StartInterval']}")
+    else:
+        times = [(item["Hour"], item["Minute"]) for item in data["StartCalendarInterval"]]
+        print(name, times)
 EOF
 }
 
