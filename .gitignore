@@ -10,6 +10,8 @@ __pycache__/
 plugins/candy/logs/
 plugins/candy/backups/
 plugins/candy/config/.optimizer_phase
+plugins/candy/config/.candy_next_ts
+plugins/candy/config/.candy_morning_ts
 plugins/candy/.candy_cwd/
 
 # Editor
