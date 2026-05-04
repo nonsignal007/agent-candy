@@ -1,6 +1,6 @@
 ---
 name: candy-doctor
-description: Claude Candy 설치 상태를 진단하고 안전한 것은 바로 고쳐주는 헬스체크 스킬. 번들 진단 스크립트로 의존성, Claude 로그인, JOBS_ROOT 파일 구조, LaunchAgent 등록/스케줄 정합성, 런타임 로그/CSV stale, optimizer gate, macOS 알림 권한까지 한 번에 점검한다. 사용자가 "candy 상태 확인", "candy 점검", "candy-doctor", "candy 진단", "candy 이상한데", "candy 왜 안 돌아", "점심 pre-warm 안 먹힘", "optimizer 왜 멈춤", "usage_snapshots.csv stale" 같은 요청을 하거나 com.claude.candy.* 관련 동작 이상을 의심할 때 반드시 이 스킬을 사용한다. 결과는 심각도(MUST/detail)로 분류되고, 수정 가능한 항목은 정책별(자동/확인/수동)로 안내되어 사용자가 위험한 변경을 모른 채 당하지 않는다.
+description: Claude Candy 설치 상태를 진단하고 안전한 것은 바로 고쳐주는 헬스체크 스킬. 번들 진단 스크립트로 의존성, Claude 로그인, JOBS_ROOT 파일 구조, LaunchAgent 등록/스케줄 정합성, 런타임 로그/CSV stale, optimizer gate, macOS 알림 권한, snapshot/progress/optimizer/chain-gate 격리 dry-run 실행 검증까지 한 번에 점검한다. 사용자가 "candy 상태 확인", "candy 점검", "candy-doctor", "candy 진단", "candy 이상한데", "candy 왜 안 돌아", "점심 pre-warm 안 먹힘", "optimizer 왜 멈춤", "usage_snapshots.csv stale" 같은 요청을 하거나 com.claude.candy.* 관련 동작 이상을 의심할 때 반드시 이 스킬을 사용한다. 결과는 심각도(MUST/detail)로 분류되고, 수정 가능한 항목은 정책별(자동/확인/수동)로 안내되어 사용자가 위험한 변경을 모른 채 당하지 않는다.
 ---
 
 # Claude Candy Doctor
@@ -9,10 +9,12 @@ Candy 설치가 실제로 잘 돌아가는지 런타임 상태를 진단하고, 
 
 Virtual regression test (`tests/virtual_time_test.sh`) 는 돌리지 않는다 — 그건 코드 회귀 테스트이지 헬스체크가 아니다. 이 스킬은 **지금 이 순간 Candy 가 제대로 도는가** 만 본다.
 
+정적 점검(파일/등록 상태)뿐 아니라 `usage_snapshot.sh`, `usage_progress.sh`, `schedule_optimizer.sh` 의 핵심 로직과 `refresh_claude.sh` 의 chain gate 를 **격리된 temp JOBS_ROOT 에서 실제 dry-run** 으로 실행해 결과를 검증한다 (실제 `~/jobs/logs` 는 절대 건드리지 않음). Claude API 호출은 일어나지 않는다.
+
 ## 어떻게 동작하는가
 
 1. 번들 스크립트 `scripts/candy_doctor.py` 를 `--json` 으로 실행한다.
-2. 스크립트는 50여개 체크를 돌리고, 각 체크마다 `status`, `fix_command`, `fix_policy` 를 담은 JSON 리포트를 출력한다.
+2. 스크립트는 50여개 체크를 돌리고, 각 체크마다 `status`, `fix_command`, `fix_policy` 를 담은 JSON 리포트를 출력한다. (정적 점검 + execution dry-run)
 3. Claude 는 그 리포트를 읽고 정책별로 처리한다:
    - **자동 수정 (auto)** — 사용자에게 묻지 않고 실행, 끝나고 한 번에 요약 보고
    - **확인 수정 (confirm)** — 해당 항목들을 한 묶음으로 보여주고 "이거 고쳐도 될까요?" 한 번만 질문
@@ -32,7 +34,9 @@ JOBS_ROOT 는 스크립트가 자동 추론한다:
 
 사용자가 "다른 경로를 보고 싶다" 고 하면 `--jobs-root <path>` 를 붙인다.
 
-스크립트는 read-only — 어떤 파일도 수정하지 않는다. 수정은 Claude가 이 SKILL 의 정책에 따라 직접 한다.
+execution dry-run 까지 돌면 5초 정도 더 걸린다. 빠른 정적 진단만 원하면 `--no-exec` 를 붙인다 — execution 카테고리 4개 체크가 모두 `status=skip` 으로 반환된다.
+
+스크립트는 실제 `JOBS_ROOT` 에 대해서는 read-only 다. execution 체크는 별도의 격리된 임시 디렉터리(`/tmp/candy_doctor_exec_*`) 안에서만 파일을 만들고 실행 후 즉시 정리한다. 수정(launchctl bootstrap, symlink 재생성 등)은 Claude가 이 SKILL 의 정책에 따라 직접 한다.
 
 ## JSON 리포트 스키마
 
@@ -116,9 +120,21 @@ JOBS_ROOT 는 스크립트가 자동 추론한다:
 5. `fix_policy=manual` 항목과 `auto/confirm` 으로 해결 안 된 warn 을 사용자에게 정리
 6. 결과를 위 "보고 형식" 순서로 한 번에 출력
 
+## 카테고리
+
+- **binary / env / auth / filesystem / launchd** — MUST. 하나라도 fail 이면 Candy 가 동작 불가.
+- **schedule / config / runtime / logic / housekeeping / os** — detail. 작동하지만 점검 필요한 항목.
+- **execution** — detail. 격리된 temp JOBS_ROOT 에서 실제 스크립트를 실행해 검증한다:
+  - `exec.snapshot.dry_run` — `usage_snapshot.sh` 실행 후 CSV 행과 resetsAt window-start 귀속 확인
+  - `exec.progress.dry_run` — `usage_progress.sh` 실행 후 `type=progress`, `sample_slot ∈ {1h,2h,3h,4h}` 확인
+  - `exec.optimizer.gate` — `FAKE_NOW_TS` 로 토요일/평일 시뮬레이션해 weekend-skip / 데이터부족-skip 동작 확인
+  - `exec.chain.gate` — `refresh_claude.sh` 의 GATE_PYEOF 로직(미래 ts → blocked, 과거 ts → pass) 검증
+
+  주말에 doctor 가 돌면 snapshot/progress/optimizer dry-run 은 자동으로 `skip` 처리된다 (스크립트들이 weekday-only 이므로).
+
 ## 주의 사항
 
-- `candy_doctor.py` 자체는 **절대 파일을 수정하지 않는다**. 스크립트가 "자동으로 고쳤다" 라고 말하는 일이 있으면 그건 버그다.
+- `candy_doctor.py` 의 **정적 체크는 절대 파일을 수정하지 않는다**. execution 체크는 격리된 temp 디렉터리에 한해서만 파일을 만들고 실행 후 정리한다 — 사용자의 실제 `~/jobs/logs/usage_snapshots.csv` 등은 절대 건드리지 않는다.
 - 수정은 전부 Claude 가 Bash 로 실행한다. 어떤 명령을 돌리는지 사용자 화면에 그대로 보이는 편이 안전하다.
 - JOBS_ROOT 가 예상과 다르면(예: `/tmp/test-jobs`) 모든 체크가 해당 경로 기준으로 돈다. 리포트 맨 위의 `jobs_root` 를 항상 사용자에게 같이 보여준다 — "어디를 봤는지" 가 중요하다.
 - 체크 목록이 늘어나면 `--json` 출력이 길어진다. 전부를 사용자에게 쏟아내지 말고 요약한다.

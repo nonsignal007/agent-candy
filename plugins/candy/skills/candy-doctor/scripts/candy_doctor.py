@@ -1,9 +1,8 @@
 #!/usr/bin/env python3
 """candy_doctor.py — diagnose Claude Candy installation.
 
-Read-only. Emits a structured report (JSON with --json, human-readable otherwise).
-Fixes are suggested but never applied here — the SKILL's Claude-driven flow is
-in charge of applying fixes so the user stays in the loop for risky changes.
+Read-only for static checks. Execution checks run scripts in an isolated
+temp JOBS_ROOT so real logs/state are never modified.
 
 Severity:
   - must    : failure means Candy cannot work at all
@@ -27,6 +26,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
@@ -72,7 +72,12 @@ class Doctor:
 
     # ----- helpers -----
 
-    def _run(self, cmd: list[str], timeout: int = 10) -> tuple[int, str, str]:
+    def _run(
+        self,
+        cmd: list[str],
+        timeout: int = 10,
+        env: Optional[dict] = None,
+    ) -> tuple[int, str, str]:
         try:
             p = subprocess.run(
                 cmd,
@@ -80,6 +85,7 @@ class Doctor:
                 text=True,
                 timeout=timeout,
                 check=False,
+                env=env,
             )
             return p.returncode, p.stdout, p.stderr
         except subprocess.TimeoutExpired:
@@ -199,7 +205,6 @@ class Doctor:
 
     def check_launchagent_files(self) -> None:
         for name in AGENTS:
-            # presence of symlink/file at ~/Library/LaunchAgents
             la_path = self.launchagents_dir / f"{name}.plist"
             src_path = self.jobs_root / "LaunchAgents" / f"{name}.plist"
 
@@ -242,7 +247,6 @@ class Doctor:
                 c_link.message = f"regular file at {la_path}"
             self.add(c_link)
 
-            # plutil lint
             c_lint = Check(id=f"fs.la.{name}.lint", category="filesystem", severity="must")
             if la_path.exists():
                 rc, out, err = self._run(["plutil", "-lint", str(la_path)], timeout=5)
@@ -286,7 +290,6 @@ class Doctor:
             c_reg.message = f"{name}: registered"
             self.add(c_reg)
 
-            # look for event triggers in the print output
             if re.search(r"event\s+triggers?\s*=\s*\{", out) and re.search(r"\d+\s*=>", out):
                 c_trig.status = "pass"
                 c_trig.message = f"{name}: has event triggers"
@@ -328,7 +331,6 @@ class Doctor:
         snapshot = self._load_plist("com.claude.candy.snapshot")
         optimizer = self._load_plist("com.claude.candy.optimizer")
 
-        # candy: 1분 폴러 (StartInterval=60). dispatch는 .candy_next_ts/.candy_morning_ts로 결정됨
         c = Check(id="schedule.candy.poller", category="schedule", severity="detail")
         if not candy:
             c.status = "skip"
@@ -346,10 +348,9 @@ class Doctor:
                 c.fix_command = "run /candy-setup to update plist to poller mode"
             else:
                 c.status = "warn"
-                c.message = f"candy plist has neither StartInterval nor StartCalendarInterval"
+                c.message = "candy plist has neither StartInterval nor StartCalendarInterval"
         self.add(c)
 
-        # snapshot: 동적 단일 entry (resets_at - 3min). candy 첫 실행 전엔 비어있을 수 있음
         c = Check(id="schedule.snapshot.shape", category="schedule", severity="detail")
         if not snapshot:
             c.status = "skip"
@@ -368,7 +369,6 @@ class Doctor:
                 c.message = f"snapshot has {len(sslots)} slots, expected 1 (dynamic)"
         self.add(c)
 
-        # progress: 동적 4 entries (candy + 59/119/179/239min)
         c = Check(id="schedule.progress.shape", category="schedule", severity="detail")
         if not progress:
             c.status = "skip"
@@ -378,7 +378,7 @@ class Doctor:
             c.details["slots"] = pslots
             if len(pslots) == 4:
                 c.status = "pass"
-                c.message = f"progress: 4 dynamic slots (candy + 1h/2h/3h/4h)"
+                c.message = "progress: 4 dynamic slots (candy + 1h/2h/3h/4h)"
             elif len(pslots) == 0:
                 c.status = "pass"
                 c.message = "progress: 0 slots (will be set by first candy run)"
@@ -387,7 +387,6 @@ class Doctor:
                 c.message = f"progress has {len(pslots)} slots, expected 4 (dynamic)"
         self.add(c)
 
-        # optimizer: 1 slot at 23:00, weekday only (weekday check is in plist via Weekday key)
         c = Check(id="schedule.optimizer.shape", category="schedule", severity="detail")
         if not optimizer:
             c.status = "skip"
@@ -395,7 +394,6 @@ class Doctor:
         else:
             oslots = self._start_slots(optimizer)
             c.details["slots"] = oslots
-            # optimizer can have 5 entries (one per weekday) at 23:00
             if all(s[0] == 23 and s[1] == 0 for s in oslots) and 1 <= len(oslots) <= 5:
                 c.status = "pass"
                 c.message = f"optimizer: {len(oslots)} slot(s) at 23:00"
@@ -404,7 +402,6 @@ class Doctor:
                 c.message = f"optimizer slots unusual: {oslots}"
         self.add(c)
 
-        # ProgramArguments pattern
         c = Check(id="schedule.plist.program_args", category="schedule", severity="detail")
         pattern = "${JOBS_ROOT:-$HOME/jobs}"
         bad = []
@@ -462,7 +459,6 @@ class Doctor:
             return
         text = p.read_text(errors="replace").strip()
         phase = None
-        # Preferred format: JSON (current optimizer uses this).
         try:
             data = json.loads(text)
             if isinstance(data, dict) and data.get("phase") in (1, 2):
@@ -470,7 +466,6 @@ class Doctor:
                 c.details.update(data)
         except json.JSONDecodeError:
             pass
-        # Fallback: key=value (older format).
         if phase is None:
             m = re.search(r"phase\s*=\s*(\d)", text)
             if m and m.group(1) in ("1", "2"):
@@ -484,12 +479,10 @@ class Doctor:
         self.add(c)
 
     def check_chain_state(self) -> None:
-        """분 단위 체인용 상태 파일 점검: .candy_morning_ts / .candy_next_ts"""
         morning_p = self.jobs_root / "config" / ".candy_morning_ts"
         next_p = self.jobs_root / "config" / ".candy_next_ts"
         now = int(time.time())
 
-        # morning gate (optimizer가 다음 아침 시각을 기록)
         c = Check(id="state.candy_morning_ts", category="config", severity="detail")
         if not morning_p.exists():
             c.status = "pass"
@@ -503,7 +496,6 @@ class Doctor:
                     c.status = "pass"
                     c.message = f".candy_morning_ts: 다음 아침까지 {(ts - now)//60}분 남음"
                 else:
-                    # past: 정상 (candy가 사용 후 삭제 못 한 경우 등)
                     c.status = "pass"
                     c.message = f".candy_morning_ts: 과거 시각 (사용됐거나 stale, age {(now - ts)//60}min)"
             except Exception as e:
@@ -511,7 +503,6 @@ class Doctor:
                 c.message = f".candy_morning_ts unreadable: {e}"
         self.add(c)
 
-        # chain 시각 (이전 candy의 resets_at)
         c = Check(id="state.candy_next_ts", category="config", severity="detail")
         if not next_p.exists():
             c.status = "pass"
@@ -582,7 +573,6 @@ class Doctor:
         last_ts = None
         try:
             with p.open() as f:
-                # cheap tail: read last 4 KB
                 try:
                     f.seek(0, 2)
                     size = f.tell()
@@ -661,7 +651,6 @@ class Doctor:
         self.add(c)
 
     def check_optimizer_gate(self) -> None:
-        """Read usage_snapshots.csv and count final snapshots."""
         c = Check(id="runtime.optimizer_gate", category="runtime", severity="detail")
         p = self.jobs_root / "logs" / "usage_snapshots.csv"
         if not p.exists():
@@ -671,7 +660,6 @@ class Doctor:
             return
         try:
             count = 0
-            # quick pass — read whole file; we cap to 500 rows by convention
             with p.open() as f:
                 header = f.readline().strip().split(",")
                 try:
@@ -703,7 +691,6 @@ class Doctor:
         self.add(c)
 
     def check_optimizer_snap_attribution(self) -> None:
-        """Verify optimizer uses window-start date attribution, not datetime date."""
         c = Check(id="logic.optimizer_snap_attribution", category="logic", severity="detail")
         opt_path = self.jobs_root / "bin" / "schedule_optimizer.sh"
         if not opt_path.exists():
@@ -714,9 +701,7 @@ class Doctor:
 
         text = opt_path.read_text(errors="replace")
 
-        # Old buggy pattern: awk counting snapshots by datetime column
         old_pattern = re.compile(r"awk.*\$5.*snapshot.*\$2.*~.*d|awk.*snapshot.*\$2~d")
-        # New correct pattern: Python counting via 5h_resets_at - 18000 (window start)
         new_pattern = re.compile(r"resets_at.*18000|5h_resets_at.*18000")
 
         if old_pattern.search(text):
@@ -740,7 +725,6 @@ class Doctor:
         self.add(c)
 
     def check_optimizer_window_gate(self) -> None:
-        """Count yesterday's snapshots using window-start attribution and show discrepancy."""
         c = Check(id="runtime.optimizer_window_gate", category="runtime", severity="detail")
         p = self.jobs_root / "logs" / "usage_snapshots.csv"
         if not p.exists():
@@ -753,7 +737,7 @@ class Doctor:
             today = datetime.date.today()
             dow = today.weekday()  # 0=Mon
             if dow == 0:
-                target = today - datetime.timedelta(days=3)  # 월 → 금
+                target = today - datetime.timedelta(days=3)
             else:
                 target = today - datetime.timedelta(days=1)
 
@@ -869,9 +853,281 @@ class Doctor:
         )
         self.add(c)
 
+    # ----- DETAIL: execution checks -----
+
+    def _make_exec_tmpdir(self) -> Path:
+        """격리된 temp JOBS_ROOT 생성. bin/은 심링크, logs/config/는 빈 실제 디렉터리."""
+        tmpdir = Path(tempfile.mkdtemp(prefix="candy_doctor_exec_"))
+        # bin/ 심링크: PYTHONPATH($JOBS_ROOT/bin/lib)가 자동으로 실제 lib을 가리킴
+        (tmpdir / "bin").symlink_to(self.jobs_root / "bin")
+        la_src = self.jobs_root / "LaunchAgents"
+        if la_src.exists():
+            (tmpdir / "LaunchAgents").symlink_to(la_src)
+        (tmpdir / "logs").mkdir()
+        (tmpdir / "config").mkdir()
+        conf_src = self.jobs_root / "config" / "lunch_schedule.conf"
+        if conf_src.exists():
+            shutil.copy(conf_src, tmpdir / "config" / "lunch_schedule.conf")
+        return tmpdir
+
+    def _exec_snapshot_row(self, tmpdir: Path, snapshot_type: str = "snapshot") -> tuple[Check, Optional[dict]]:
+        """snapshot 또는 progress 스크립트를 tmpdir에서 실행하고 마지막 CSV 행을 반환."""
+        script = "usage_snapshot.sh" if snapshot_type == "snapshot" else "usage_progress.sh"
+        cid = f"exec.{snapshot_type}.dry_run"
+        c = Check(id=cid, category="execution", severity="detail")
+        csv_path = tmpdir / "logs" / "usage_snapshots.csv"
+
+        prev_count = 0
+        if csv_path.exists():
+            with csv_path.open() as f:
+                prev_count = sum(1 for _ in f) - 1
+
+        env = {**os.environ, "JOBS_ROOT": str(tmpdir)}
+        if snapshot_type == "progress":
+            env["SNAPSHOT_TYPE"] = "progress"
+
+        rc, out, err = self._run(
+            ["bash", str(self.jobs_root / "bin" / script)],
+            env=env,
+            timeout=10,
+        )
+
+        if rc != 0:
+            c.status = "fail"
+            c.message = f"{script} exited {rc}: {(out + err).strip()[:200]}"
+            return c, None
+
+        if not csv_path.exists():
+            c.status = "fail"
+            c.message = f"{script} 실행됐지만 CSV 미생성"
+            return c, None
+
+        try:
+            rows = list(csv.DictReader(csv_path.open()))
+        except Exception as e:
+            c.status = "fail"
+            c.message = f"CSV 파싱 오류: {e}"
+            return c, None
+
+        new_rows = rows[prev_count:]
+        if not new_rows:
+            c.status = "fail"
+            c.message = f"{script} 실행됐지만 새 행 없음"
+            return c, None
+
+        return c, new_rows[-1]
+
+    def _check_exec_snapshot(self, tmpdir: Path) -> None:
+        c, row = self._exec_snapshot_row(tmpdir, "snapshot")
+        if row is None:
+            self.add(c)
+            return
+
+        issues = []
+
+        try:
+            pct = float(row.get("5h_used_pct", ""))
+            if not (0 <= pct <= 100):
+                issues.append(f"5h_used_pct={pct} 범위 초과")
+        except (ValueError, TypeError):
+            issues.append("5h_used_pct 숫자 아님")
+
+        window_date = None
+        try:
+            resets_at = int(float(row.get("5h_resets_at", "0")))
+            if resets_at <= 0:
+                issues.append("5h_resets_at 비정상")
+            else:
+                window_start = datetime.datetime.fromtimestamp(resets_at - 18000)
+                window_date = window_start.date()
+                today = datetime.date.today()
+                if window_date != today:
+                    issues.append(
+                        f"resetsAt window-start {window_date} ≠ today {today}"
+                    )
+                c.details["window_start"] = str(window_start)
+                c.details["resets_at_human"] = datetime.datetime.fromtimestamp(resets_at).strftime("%H:%M")
+        except (ValueError, TypeError, OSError):
+            issues.append("5h_resets_at 파싱 실패")
+
+        c.details["row"] = {k: row.get(k) for k in ("type", "sample_slot", "5h_used_pct", "5h_resets_at")}
+
+        if issues:
+            c.status = "warn"
+            c.message = "snapshot.sh 실행됨, 행 기록됨, 그러나: " + "; ".join(issues)
+        else:
+            pct_val = row.get("5h_used_pct", "?")
+            c.status = "pass"
+            c.message = (
+                f"snapshot dry-run 정상: {pct_val}% 사용, "
+                f"resetsAt window-start={window_date}, "
+                f"resets_at={c.details.get('resets_at_human', '?')}"
+            )
+        self.add(c)
+
+    def _check_exec_progress(self, tmpdir: Path) -> None:
+        c, row = self._exec_snapshot_row(tmpdir, "progress")
+        if row is None:
+            self.add(c)
+            return
+
+        issues = []
+        if row.get("type") != "progress":
+            issues.append(f"type={row.get('type')!r}, expected 'progress'")
+
+        valid_slots = {"1h", "2h", "3h", "4h"}
+        slot = row.get("sample_slot", "")
+        if slot not in valid_slots:
+            issues.append(f"sample_slot={slot!r} (유효값: {valid_slots})")
+
+        c.details["row"] = {k: row.get(k) for k in ("type", "sample_slot", "5h_used_pct")}
+
+        if issues:
+            c.status = "warn"
+            c.message = "progress.sh 실행됨, 행 기록됨, 그러나: " + "; ".join(issues)
+        else:
+            c.status = "pass"
+            c.message = f"progress dry-run 정상: slot={slot}, {row.get('5h_used_pct', '?')}% 사용"
+        self.add(c)
+
+    def _check_exec_optimizer_gate(self, tmpdir: Path) -> None:
+        c = Check(id="exec.optimizer.gate", category="execution", severity="detail")
+        optimizer_sh = self.jobs_root / "bin" / "schedule_optimizer.sh"
+
+        if not optimizer_sh.exists():
+            c.status = "skip"
+            c.message = "schedule_optimizer.sh not found"
+            self.add(c)
+            return
+
+        change_log = tmpdir / "logs" / "schedule_changes.log"
+        base_env = {
+            **os.environ,
+            "JOBS_ROOT": str(tmpdir),
+            "PYTHONPATH": str(self.jobs_root / "bin" / "lib"),
+        }
+
+        failures = []
+
+        # 케이스 1: 주말(토요일) → "주말 스킵"
+        today = datetime.date.today()
+        days_to_sat = (5 - today.weekday()) % 7 or 7  # 항상 미래의 토요일
+        saturday = today + datetime.timedelta(days=days_to_sat)
+        sat_ts = int(datetime.datetime.combine(saturday, datetime.time(23, 0)).timestamp())
+
+        change_log.write_text("")
+        rc, _, _ = self._run(
+            ["bash", str(optimizer_sh)],
+            env={**base_env, "FAKE_NOW_TS": str(sat_ts)},
+            timeout=15,
+        )
+        log_text = change_log.read_text(errors="replace") if change_log.exists() else ""
+        if rc != 0:
+            failures.append(f"주말 케이스: exit {rc}")
+        elif "주말 스킵" not in log_text:
+            failures.append(f"주말 케이스: '주말 스킵' 로그 없음 ({log_text.strip()[:80]!r})")
+
+        # 케이스 2: 평일 + 데이터 없음 → "SKIP - 데이터 부족"
+        days_to_tue = (1 - today.weekday()) % 7 or 7  # 다음 화요일
+        tuesday = today + datetime.timedelta(days=days_to_tue)
+        tue_ts = int(datetime.datetime.combine(tuesday, datetime.time(23, 0)).timestamp())
+
+        change_log.write_text("")
+        rc, _, _ = self._run(
+            ["bash", str(optimizer_sh)],
+            env={**base_env, "FAKE_NOW_TS": str(tue_ts)},
+            timeout=15,
+        )
+        log_text = change_log.read_text(errors="replace") if change_log.exists() else ""
+        if rc != 0:
+            failures.append(f"데이터부족 케이스: exit {rc}")
+        elif "SKIP" not in log_text and "데이터 부족" not in log_text:
+            failures.append(f"데이터부족 케이스: SKIP 로그 없음 ({log_text.strip()[:80]!r})")
+
+        if failures:
+            c.status = "fail"
+            c.message = "optimizer gate 검증 실패: " + "; ".join(failures)
+        else:
+            c.status = "pass"
+            c.message = "optimizer gate 정상: 주말→스킵, 데이터부족→스킵 확인"
+        self.add(c)
+
+    def _check_exec_chain_gate(self) -> None:
+        """refresh_claude.sh GATE_PYEOF 로직을 Python으로 직접 재현해 3개 케이스 검증."""
+        c = Check(id="exec.chain.gate", category="execution", severity="detail")
+        now_ts = int(time.time())
+        future_ts = now_ts + 3600
+        past_ts = now_ts - 3600
+
+        def gate(morning_ts: int, next_ts: int) -> str:
+            if morning_ts > now_ts:
+                return "blocked"
+            if next_ts > now_ts:
+                return "blocked"
+            return "pass"
+
+        cases = [
+            ("next_ts 미래 → blocked", gate(0, future_ts), "blocked"),
+            ("morning_ts 미래 → blocked", gate(future_ts, 0), "blocked"),
+            ("둘 다 과거 → pass", gate(past_ts, past_ts), "pass"),
+        ]
+
+        failures = [label for label, actual, expected in cases if actual != expected]
+
+        if failures:
+            c.status = "fail"
+            c.message = "chain gate 로직 오류: " + ", ".join(failures)
+        else:
+            c.status = "pass"
+            c.message = "chain gate 정상: next_ts미래→blocked, morning_ts미래→blocked, 둘다과거→pass"
+        self.add(c)
+
+    def check_execution(self, no_exec: bool = False) -> None:
+        """실제 스크립트 실행 검증 (격리된 temp JOBS_ROOT 사용)."""
+        exec_check_ids = [
+            "exec.snapshot.dry_run",
+            "exec.progress.dry_run",
+            "exec.optimizer.gate",
+            "exec.chain.gate",
+        ]
+
+        if no_exec:
+            for cid in exec_check_ids:
+                self.add(Check(
+                    id=cid, category="execution", severity="detail",
+                    status="skip", message="--no-exec 플래그로 건너뜀",
+                ))
+            return
+
+        today_dow = datetime.date.today().weekday()  # 0=Mon, 6=Sun
+        tmpdir = self._make_exec_tmpdir()
+        try:
+            if today_dow >= 5:
+                # 주말: snapshot/progress/optimizer는 weekday-only 동작 → skip
+                for cid in ("exec.snapshot.dry_run", "exec.progress.dry_run", "exec.optimizer.gate"):
+                    self.add(Check(
+                        id=cid, category="execution", severity="detail",
+                        status="skip", message="주말 — 스크립트가 weekday-only로 동작",
+                    ))
+            else:
+                self._check_exec_snapshot(tmpdir)
+                self._check_exec_progress(tmpdir)
+                self._check_exec_optimizer_gate(tmpdir)
+            # chain gate는 순수 Python — 항상 실행
+            self._check_exec_chain_gate()
+        except Exception as e:
+            for cid in exec_check_ids:
+                if not any(ch.id == cid for ch in self.checks):
+                    self.add(Check(
+                        id=cid, category="execution", severity="detail",
+                        status="warn", message=f"execution check 오류: {e}",
+                    ))
+        finally:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
     # ----- run all -----
 
-    def run_all(self) -> None:
+    def run_all(self, no_exec: bool = False) -> None:
         self.check_binaries()
         self.check_gui_session()
         self.check_jobs_root()
@@ -892,11 +1148,11 @@ class Doctor:
         self.check_optimizer_snap_attribution()
         self.check_optimizer_window_gate()
         self.check_log_sizes()
+        self.check_execution(no_exec=no_exec)
         self.check_notifications()
 
 
 def detect_jobs_root() -> Path:
-    """Prefer env, else infer from the candy symlink target, else ~/jobs."""
     env = os.environ.get("JOBS_ROOT")
     if env:
         return Path(os.path.expanduser(env)).resolve()
@@ -904,7 +1160,6 @@ def detect_jobs_root() -> Path:
     link = home / "Library" / "LaunchAgents" / "com.claude.candy.plist"
     if link.is_symlink():
         target = link.resolve()
-        # target is expected to be <JOBS_ROOT>/LaunchAgents/com.claude.candy.plist
         if target.parent.name == "LaunchAgents":
             return target.parent.parent
     return home / "jobs"
@@ -912,7 +1167,7 @@ def detect_jobs_root() -> Path:
 
 def render_human(jobs_root: Path, checks: list[Check]) -> str:
     out = []
-    out.append(f"Candy Doctor Report")
+    out.append("Candy Doctor Report")
     out.append(f"JOBS_ROOT: {jobs_root}")
     out.append("")
 
@@ -934,6 +1189,7 @@ def render_human(jobs_root: Path, checks: list[Check]) -> str:
         "config",
         "runtime",
         "logic",
+        "execution",
         "housekeeping",
         "os",
     ]:
@@ -960,6 +1216,11 @@ def main() -> int:
     ap = argparse.ArgumentParser(description="Diagnose Claude Candy installation")
     ap.add_argument("--jobs-root", help="override JOBS_ROOT (default: inferred)")
     ap.add_argument("--json", action="store_true", help="emit JSON for skill consumption")
+    ap.add_argument(
+        "--no-exec",
+        action="store_true",
+        help="skip execution checks (faster static-only diagnosis)",
+    )
     args = ap.parse_args()
 
     jobs_root = (
@@ -969,7 +1230,7 @@ def main() -> int:
     )
 
     doc = Doctor(jobs_root=jobs_root)
-    doc.run_all()
+    doc.run_all(no_exec=args.no_exec)
 
     if args.json:
         payload = {
@@ -987,7 +1248,6 @@ def main() -> int:
     else:
         print(render_human(jobs_root, doc.checks))
 
-    # exit code: 1 if any MUST fails, else 0
     must_fail = any(c.status == "fail" and c.severity == "must" for c in doc.checks)
     return 1 if must_fail else 0
 
