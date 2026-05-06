@@ -12,6 +12,18 @@ Fix policy (per check, when applicable):
   - auto    : safe, reversible, no user confirmation needed
   - confirm : touches system state (launchctl, symlinks), ask user first
   - manual  : user must act (logins, macOS settings, missing binaries)
+
+Structure:
+  DoctorContext         shared state + helpers (_run_cmd, _which, _load_plist)
+  BinaryAuthChecker     binary / env / auth checks
+  FilesystemChecker     filesystem layout checks
+  LaunchDChecker        launchd registration + schedule-stale checks
+  ScheduleChecker       plist schedule shape checks
+  ConfigChecker         config file + chain-state checks
+  RuntimeChecker        runtime logs, CSV, optimizer-gate, version-sync checks
+  HousekeepingChecker   log sizes + macOS notification permission
+  ExecutionChecker      isolated dry-run execution checks
+  Doctor                thin orchestrator
 """
 
 from __future__ import annotations
@@ -47,6 +59,10 @@ BIN_SCRIPTS = [
 ]
 
 
+# ---------------------------------------------------------------------------
+# Data model
+# ---------------------------------------------------------------------------
+
 @dataclass
 class Check:
     id: str
@@ -59,20 +75,18 @@ class Check:
     details: dict[str, Any] = field(default_factory=dict)
 
 
-class Doctor:
-    def __init__(self, jobs_root: Path) -> None:
-        self.jobs_root = jobs_root
-        self.home = Path(os.path.expanduser("~"))
-        self.launchagents_dir = self.home / "Library" / "LaunchAgents"
-        self.uid = os.getuid()
-        self.checks: list[Check] = []
+# ---------------------------------------------------------------------------
+# Shared context
+# ---------------------------------------------------------------------------
 
-    def add(self, check: Check) -> None:
-        self.checks.append(check)
+@dataclass
+class DoctorContext:
+    jobs_root: Path
+    home: Path
+    launchagents_dir: Path
+    uid: int
 
-    # ----- helpers -----
-
-    def _run(
+    def run_cmd(
         self,
         cmd: list[str],
         timeout: int = 10,
@@ -93,15 +107,52 @@ class Doctor:
         except FileNotFoundError:
             return 127, "", "not found"
 
-    def _which(self, name: str) -> Optional[str]:
+    def which(self, name: str) -> Optional[str]:
         return shutil.which(name)
 
-    # ----- MUST: binaries -----
+    def load_plist(self, name: str) -> Optional[dict]:
+        path = self.jobs_root / "LaunchAgents" / f"{name}.plist"
+        if not path.exists():
+            return None
+        try:
+            with open(path, "rb") as f:
+                return plistlib.load(f)
+        except Exception:
+            return None
 
-    def check_binaries(self) -> None:
-        for name in ("claude", "python3", "launchctl", "plutil", "osascript"):
+
+def make_context(jobs_root: Path) -> DoctorContext:
+    home = Path(os.path.expanduser("~"))
+    return DoctorContext(
+        jobs_root=jobs_root,
+        home=home,
+        launchagents_dir=home / "Library" / "LaunchAgents",
+        uid=os.getuid(),
+    )
+
+
+# ---------------------------------------------------------------------------
+# BinaryAuthChecker — binary / env / auth
+# ---------------------------------------------------------------------------
+
+class BinaryAuthChecker:
+    _BINS = ("claude", "python3", "launchctl", "plutil", "osascript")
+
+    def __init__(self, ctx: DoctorContext) -> None:
+        self.ctx = ctx
+
+    def run(self) -> list[Check]:
+        checks: list[Check] = []
+        checks.extend(self._check_binaries())
+        checks.append(self._check_gui_session())
+        checks.append(self._check_claude_preflight())
+        return checks
+
+    def _check_binaries(self) -> list[Check]:
+        checks = []
+        for name in self._BINS:
             c = Check(id=f"bin.{name}", category="binary", severity="must")
-            path = self._which(name)
+            path = self.ctx.which(name)
             if path:
                 c.status = "pass"
                 c.message = f"{name} found at {path}"
@@ -111,13 +162,26 @@ class Doctor:
                 c.message = f"{name} not found on PATH"
                 c.fix_policy = "manual"
                 c.fix_command = f"install {name} and ensure it is on PATH"
-            self.add(c)
+            checks.append(c)
+        return checks
 
-    # ----- MUST: claude preflight -----
+    def _check_gui_session(self) -> Check:
+        c = Check(id="env.gui_session", category="env", severity="must")
+        rc, _, _ = self.ctx.run_cmd(["launchctl", "print", f"gui/{self.ctx.uid}"], timeout=5)
+        if rc == 0:
+            c.status = "pass"
+            c.message = f"gui/{self.ctx.uid} launchd domain reachable"
+        else:
+            c.status = "fail"
+            c.message = (
+                f"launchctl cannot reach gui/{self.ctx.uid} — are you in a GUI login session?"
+            )
+            c.fix_policy = "manual"
+        return c
 
-    def check_claude_preflight(self) -> None:
+    def _check_claude_preflight(self) -> Check:
         c = Check(id="auth.claude_preflight", category="auth", severity="must")
-        rc, out, err = self._run(
+        rc, out, err = self.ctx.run_cmd(
             ["claude", "-p", "--output-format", "json", "Respond only ok"],
             timeout=45,
         )
@@ -130,62 +194,60 @@ class Doctor:
             c.fix_policy = "manual"
             c.fix_command = "run `claude` in a terminal and sign in again"
             c.details["stderr"] = err.strip()[:500]
-        self.add(c)
+        return c
 
-    # ----- MUST: session / GUI -----
 
-    def check_gui_session(self) -> None:
-        c = Check(id="env.gui_session", category="env", severity="must")
-        rc, out, _ = self._run(["launchctl", "print", f"gui/{self.uid}"], timeout=5)
-        if rc == 0:
-            c.status = "pass"
-            c.message = f"gui/{self.uid} launchd domain reachable"
-        else:
-            c.status = "fail"
-            c.message = (
-                f"launchctl cannot reach gui/{self.uid} — are you in a GUI login session?"
-            )
-            c.fix_policy = "manual"
-        self.add(c)
+# ---------------------------------------------------------------------------
+# FilesystemChecker — JOBS_ROOT layout, bin executables, LaunchAgent files
+# ---------------------------------------------------------------------------
 
-    # ----- MUST: JOBS_ROOT layout -----
+class FilesystemChecker:
+    _REQUIRED_LAYOUT = ["bin", "LaunchAgents", "tests", "config/lunch_schedule.conf"]
 
-    def check_jobs_root(self) -> None:
+    def __init__(self, ctx: DoctorContext) -> None:
+        self.ctx = ctx
+
+    def run(self) -> list[Check]:
+        checks: list[Check] = []
+        checks.extend(self._check_jobs_root())
+        checks.extend(self._check_bin_executables())
+        checks.extend(self._check_launchagent_files())
+        return checks
+
+    def _check_jobs_root(self) -> list[Check]:
+        checks = []
         c = Check(id="fs.jobs_root_exists", category="filesystem", severity="must")
-        if self.jobs_root.is_dir():
-            c.status = "pass"
-            c.message = f"JOBS_ROOT exists: {self.jobs_root}"
-        else:
+        if not self.ctx.jobs_root.is_dir():
             c.status = "fail"
-            c.message = f"JOBS_ROOT does not exist: {self.jobs_root}"
+            c.message = f"JOBS_ROOT does not exist: {self.ctx.jobs_root}"
             c.fix_policy = "confirm"
-            c.fix_command = f"run /candy-setup to deploy bundle to {self.jobs_root}"
-            self.add(c)
-            return
-        self.add(c)
-
-        required = ["bin", "LaunchAgents", "tests", "config/lunch_schedule.conf"]
-        for rel in required:
-            c = Check(
+            c.fix_command = f"run /candy-setup to deploy bundle to {self.ctx.jobs_root}"
+            return [c]
+        c.status = "pass"
+        c.message = f"JOBS_ROOT exists: {self.ctx.jobs_root}"
+        checks.append(c)
+        for rel in self._REQUIRED_LAYOUT:
+            c2 = Check(
                 id=f"fs.jobs_root.{rel.replace('/', '_')}",
                 category="filesystem",
                 severity="must",
             )
-            p = self.jobs_root / rel
-            if p.exists():
-                c.status = "pass"
-                c.message = f"present: {rel}"
+            if (self.ctx.jobs_root / rel).exists():
+                c2.status = "pass"
+                c2.message = f"present: {rel}"
             else:
-                c.status = "fail"
-                c.message = f"missing: {rel}"
-                c.fix_policy = "confirm"
-                c.fix_command = "run /candy-setup to restore bundle files"
-            self.add(c)
+                c2.status = "fail"
+                c2.message = f"missing: {rel}"
+                c2.fix_policy = "confirm"
+                c2.fix_command = "run /candy-setup to restore bundle files"
+            checks.append(c2)
+        return checks
 
-    def check_bin_executables(self) -> None:
+    def _check_bin_executables(self) -> list[Check]:
+        checks = []
         for name in BIN_SCRIPTS:
             c = Check(id=f"fs.bin.{name}.executable", category="filesystem", severity="must")
-            p = self.jobs_root / "bin" / name
+            p = self.ctx.jobs_root / "bin" / name
             if not p.is_file():
                 c.status = "fail"
                 c.message = f"missing bin/{name}"
@@ -199,40 +261,48 @@ class Doctor:
             else:
                 c.status = "pass"
                 c.message = f"bin/{name} executable"
-            self.add(c)
+            checks.append(c)
+        return checks
 
-    # ----- MUST: LaunchAgent files + symlinks + lint -----
-
-    def check_launchagent_files(self) -> None:
+    def _check_launchagent_files(self) -> list[Check]:
+        checks = []
         for name in AGENTS:
-            la_path = self.launchagents_dir / f"{name}.plist"
-            src_path = self.jobs_root / "LaunchAgents" / f"{name}.plist"
+            la_path = self.ctx.launchagents_dir / f"{name}.plist"
+            src_path = self.ctx.jobs_root / "LaunchAgents" / f"{name}.plist"
 
-            c_link = Check(id=f"fs.la.{name}.symlink", category="filesystem", severity="must")
+            c_link = Check(
+                id=f"fs.la.{name}.symlink", category="filesystem", severity="must"
+            )
             if not la_path.exists() and not la_path.is_symlink():
                 c_link.status = "fail"
                 c_link.message = f"{la_path} missing"
-                if src_path.exists():
-                    c_link.fix_policy = "confirm"
-                    c_link.fix_command = f"ln -sfn {src_path} {la_path}"
-                else:
-                    c_link.fix_policy = "confirm"
-                    c_link.fix_command = "run /candy-setup to deploy bundle and link"
-                self.add(c_link)
+                c_link.fix_policy = "confirm"
+                c_link.fix_command = (
+                    f"ln -sfn {src_path} {la_path}"
+                    if src_path.exists()
+                    else "run /candy-setup to deploy bundle and link"
+                )
+                checks.append(c_link)
+                checks.append(Check(
+                    id=f"fs.la.{name}.lint",
+                    category="filesystem",
+                    severity="must",
+                    status="skip",
+                    message="skipped (file missing)",
+                ))
                 continue
+
             if la_path.is_symlink():
                 target = la_path.resolve()
                 c_link.details["target"] = str(target)
                 if not target.exists():
                     c_link.status = "fail"
                     c_link.message = f"symlink points to missing target: {target}"
-                    if src_path.exists():
-                        c_link.fix_policy = "confirm"
-                        c_link.fix_command = f"ln -sfn {src_path} {la_path}"
-                    else:
-                        c_link.fix_policy = "confirm"
-                        c_link.fix_command = "run /candy-setup"
-                elif src_path.exists() and target.resolve() != src_path.resolve():
+                    c_link.fix_policy = "confirm"
+                    c_link.fix_command = (
+                        f"ln -sfn {src_path} {la_path}" if src_path.exists() else "run /candy-setup"
+                    )
+                elif src_path.exists() and target != src_path.resolve():
                     c_link.status = "warn"
                     c_link.message = (
                         f"symlink points at {target}, not {src_path} — unexpected but usable"
@@ -245,11 +315,13 @@ class Doctor:
             else:
                 c_link.status = "pass"
                 c_link.message = f"regular file at {la_path}"
-            self.add(c_link)
+            checks.append(c_link)
 
-            c_lint = Check(id=f"fs.la.{name}.lint", category="filesystem", severity="must")
+            c_lint = Check(
+                id=f"fs.la.{name}.lint", category="filesystem", severity="must"
+            )
             if la_path.exists():
-                rc, out, err = self._run(["plutil", "-lint", str(la_path)], timeout=5)
+                rc, out, err = self.ctx.run_cmd(["plutil", "-lint", str(la_path)], timeout=5)
                 if rc == 0:
                     c_lint.status = "pass"
                     c_lint.message = f"{name}.plist: OK"
@@ -261,204 +333,281 @@ class Doctor:
             else:
                 c_lint.status = "skip"
                 c_lint.message = "skipped (file missing)"
-            self.add(c_lint)
+            checks.append(c_lint)
+        return checks
 
-    # ----- MUST: launchctl print registration -----
 
-    def check_agent_registration(self) -> None:
+# ---------------------------------------------------------------------------
+# LaunchDChecker — registration + schedule-stale detection
+# ---------------------------------------------------------------------------
+
+class LaunchDChecker:
+    def __init__(self, ctx: DoctorContext) -> None:
+        self.ctx = ctx
+
+    def run(self) -> list[Check]:
+        checks: list[Check] = []
         for name in AGENTS:
-            c_reg = Check(id=f"launchd.{name}.registered", category="launchd", severity="must")
-            c_trig = Check(id=f"launchd.{name}.has_triggers", category="launchd", severity="must")
-            rc, out, err = self._run(
-                ["launchctl", "print", f"gui/{self.uid}/{name}"], timeout=10
+            checks.extend(self._check_agent(name))
+        return checks
+
+    def _check_agent(self, name: str) -> list[Check]:
+        c_reg = Check(id=f"launchd.{name}.registered", category="launchd", severity="must")
+        c_trig = Check(id=f"launchd.{name}.has_triggers", category="launchd", severity="must")
+        c_stale = Check(
+            id=f"launchd.{name}.schedule_stale", category="launchd", severity="must"
+        )
+
+        rc, out, err = self.ctx.run_cmd(
+            ["launchctl", "print", f"gui/{self.ctx.uid}/{name}"], timeout=10
+        )
+        if rc != 0 or "Could not find service" in (out + err):
+            la = self.ctx.launchagents_dir / f"{name}.plist"
+            c_reg.status = "fail"
+            c_reg.message = f"{name}: not registered in gui/{self.ctx.uid}"
+            c_reg.fix_policy = "confirm"
+            c_reg.fix_command = (
+                f"launchctl bootout gui/{self.ctx.uid} {la} 2>/dev/null; "
+                f"launchctl bootstrap gui/{self.ctx.uid} {la}"
             )
-            if rc != 0 or "Could not find service" in (out + err):
-                c_reg.status = "fail"
-                c_reg.message = f"{name}: not registered in gui/{self.uid}"
-                la = self.launchagents_dir / f"{name}.plist"
-                c_reg.fix_policy = "confirm"
-                c_reg.fix_command = (
-                    f"launchctl bootout gui/{self.uid} {la} 2>/dev/null; "
-                    f"launchctl bootstrap gui/{self.uid} {la}"
-                )
-                c_trig.status = "skip"
-                c_trig.message = "skipped (agent not registered)"
-                self.add(c_reg)
-                self.add(c_trig)
-                continue
-            c_reg.status = "pass"
-            c_reg.message = f"{name}: registered"
-            self.add(c_reg)
+            c_trig.status = "skip"
+            c_trig.message = "skipped (agent not registered)"
+            c_stale.status = "skip"
+            c_stale.message = "skipped (agent not registered)"
+            return [c_reg, c_trig, c_stale]
 
-            if re.search(r"event\s+triggers?\s*=\s*\{", out) and re.search(r"\d+\s*=>", out):
-                c_trig.status = "pass"
-                c_trig.message = f"{name}: has event triggers"
-            else:
-                c_trig.status = "warn"
-                c_trig.message = (
-                    f"{name}: launchctl print did not show event triggers — plist may be empty"
-                )
-                c_trig.fix_policy = "confirm"
-                c_trig.fix_command = "inspect plist and re-bootstrap"
-            self.add(c_trig)
+        c_reg.status = "pass"
+        c_reg.message = f"{name}: registered"
 
-    # ----- DETAIL: schedule alignment -----
+        # has_triggers: StartInterval agents show "run interval = N seconds";
+        # CalendarInterval agents show "event triggers" with Hour/Minute descriptors.
+        has_event_triggers = bool(
+            re.search(r"event\s+triggers?\s*=\s*\{", out)
+            and re.search(r"\d+\s*=>", out)
+        )
+        has_run_interval = bool(re.search(r"run interval\s*=\s*\d+", out))
+        if has_event_triggers or has_run_interval:
+            c_trig.status = "pass"
+            c_trig.message = f"{name}: has event triggers"
+        else:
+            c_trig.status = "warn"
+            c_trig.message = (
+                f"{name}: launchctl print did not show event triggers — plist may be empty"
+            )
+            c_trig.fix_policy = "confirm"
+            c_trig.fix_command = "inspect plist and re-bootstrap"
 
-    def _load_plist(self, name: str) -> Optional[dict]:
-        path = self.jobs_root / "LaunchAgents" / f"{name}.plist"
-        if not path.exists():
-            return None
+        # schedule_stale: compare plist file schedule type vs launchd live registration.
+        # Detects when plist was updated (e.g. StartInterval=60) but agent was never reloaded
+        # so launchd still fires on the old CalendarInterval Hour/Minute schedule.
+        la_file = self.ctx.launchagents_dir / f"{name}.plist"
+        plist_data: Optional[dict] = None
         try:
-            with open(path, "rb") as f:
-                return plistlib.load(f)
+            with open(la_file, "rb") as _f:
+                plist_data = plistlib.load(_f)
         except Exception:
-            return None
+            pass
 
-    def _start_slots(self, data: dict) -> list[tuple[int, int]]:
+        if plist_data is None:
+            c_stale.status = "skip"
+            c_stale.message = f"{name}: plist 읽기 실패, 비교 스킵"
+        else:
+            wants_interval = "StartInterval" in plist_data
+            has_cal_in_launchd = bool(re.search(r'"Hour"\s*=>', out))
+            if wants_interval and has_cal_in_launchd:
+                interval_val = plist_data.get("StartInterval", "?")
+                c_stale.status = "fail"
+                c_stale.message = (
+                    f"{name}: plist은 StartInterval={interval_val}s이지만 "
+                    f"launchd는 CalendarInterval로 동작 중 — reload 필요"
+                )
+                c_stale.fix_policy = "confirm"
+                c_stale.fix_command = (
+                    f"launchctl bootout gui/{self.ctx.uid} {la_file}; "
+                    f"launchctl bootstrap gui/{self.ctx.uid} {la_file}"
+                )
+            else:
+                c_stale.status = "pass"
+                c_stale.message = f"{name}: schedule 일치 (plist ↔ launchd)"
+
+        return [c_reg, c_trig, c_stale]
+
+
+# ---------------------------------------------------------------------------
+# ScheduleChecker — plist schedule shape
+# ---------------------------------------------------------------------------
+
+class ScheduleChecker:
+    def __init__(self, ctx: DoctorContext) -> None:
+        self.ctx = ctx
+
+    def run(self) -> list[Check]:
+        candy = self.ctx.load_plist("com.claude.candy")
+        progress = self.ctx.load_plist("com.claude.candy.progress")
+        snapshot = self.ctx.load_plist("com.claude.candy.snapshot")
+        optimizer = self.ctx.load_plist("com.claude.candy.optimizer")
+        return [
+            self._check_candy_mode(candy),
+            self._check_snapshot_shape(snapshot),
+            self._check_progress_shape(progress),
+            self._check_optimizer_shape(optimizer),
+            self._check_program_args([candy, progress, snapshot, optimizer]),
+        ]
+
+    @staticmethod
+    def _start_slots(data: dict) -> list[tuple[int, int]]:
         raw = data.get("StartCalendarInterval", []) or []
         if isinstance(raw, dict):
             raw = [raw]
-        out = []
-        for item in raw:
-            h = int(item.get("Hour", -1))
-            m = int(item.get("Minute", -1))
-            out.append((h, m))
-        return out
+        return [(int(item.get("Hour", -1)), int(item.get("Minute", -1))) for item in raw]
 
-    def check_schedule(self) -> None:
-        candy = self._load_plist("com.claude.candy")
-        progress = self._load_plist("com.claude.candy.progress")
-        snapshot = self._load_plist("com.claude.candy.snapshot")
-        optimizer = self._load_plist("com.claude.candy.optimizer")
-
+    def _check_candy_mode(self, candy: Optional[dict]) -> Check:
         c = Check(id="schedule.candy.poller", category="schedule", severity="detail")
         if not candy:
             c.status = "skip"
             c.message = "candy plist missing"
+            return c
+        interval = candy.get("StartInterval")
+        cal = candy.get("StartCalendarInterval")
+        if isinstance(interval, int) and 30 <= interval <= 120:
+            c.status = "pass"
+            c.message = f"candy: poller mode (StartInterval={interval}s)"
+        elif cal:
+            c.status = "warn"
+            c.message = (
+                "candy still uses legacy StartCalendarInterval — should be StartInterval=60 (poller)"
+            )
+            c.fix_policy = "confirm"
+            c.fix_command = "run /candy-setup to update plist to poller mode"
         else:
-            interval = candy.get("StartInterval")
-            cal = candy.get("StartCalendarInterval")
-            if isinstance(interval, int) and 30 <= interval <= 120:
-                c.status = "pass"
-                c.message = f"candy: poller mode (StartInterval={interval}s)"
-            elif cal:
-                c.status = "warn"
-                c.message = "candy still uses legacy StartCalendarInterval — should be StartInterval=60 (poller)"
-                c.fix_policy = "confirm"
-                c.fix_command = "run /candy-setup to update plist to poller mode"
-            else:
-                c.status = "warn"
-                c.message = "candy plist has neither StartInterval nor StartCalendarInterval"
-        self.add(c)
+            c.status = "warn"
+            c.message = "candy plist has neither StartInterval nor StartCalendarInterval"
+        return c
 
+    def _check_snapshot_shape(self, snapshot: Optional[dict]) -> Check:
         c = Check(id="schedule.snapshot.shape", category="schedule", severity="detail")
         if not snapshot:
             c.status = "skip"
             c.message = "snapshot plist missing"
+            return c
+        sslots = self._start_slots(snapshot)
+        c.details["slots"] = sslots
+        if len(sslots) == 1:
+            c.status = "pass"
+            c.message = f"snapshot: 1 dynamic slot (resets_at - 3min) → {sslots}"
+        elif len(sslots) == 0:
+            c.status = "pass"
+            c.message = "snapshot: 0 slots (will be set by first candy run)"
         else:
-            sslots = self._start_slots(snapshot)
-            c.details["slots"] = sslots
-            if len(sslots) == 1:
-                c.status = "pass"
-                c.message = f"snapshot: 1 dynamic slot (resets_at - 3min) → {sslots}"
-            elif len(sslots) == 0:
-                c.status = "pass"
-                c.message = "snapshot: 0 slots (will be set by first candy run)"
-            else:
-                c.status = "warn"
-                c.message = f"snapshot has {len(sslots)} slots, expected 1 (dynamic)"
-        self.add(c)
+            c.status = "warn"
+            c.message = f"snapshot has {len(sslots)} slots, expected 1 (dynamic)"
+        return c
 
+    def _check_progress_shape(self, progress: Optional[dict]) -> Check:
         c = Check(id="schedule.progress.shape", category="schedule", severity="detail")
         if not progress:
             c.status = "skip"
             c.message = "progress plist missing"
+            return c
+        pslots = self._start_slots(progress)
+        c.details["slots"] = pslots
+        if len(pslots) == 4:
+            c.status = "pass"
+            c.message = "progress: 4 dynamic slots (candy + 1h/2h/3h/4h)"
+        elif len(pslots) == 0:
+            c.status = "pass"
+            c.message = "progress: 0 slots (will be set by first candy run)"
         else:
-            pslots = self._start_slots(progress)
-            c.details["slots"] = pslots
-            if len(pslots) == 4:
-                c.status = "pass"
-                c.message = "progress: 4 dynamic slots (candy + 1h/2h/3h/4h)"
-            elif len(pslots) == 0:
-                c.status = "pass"
-                c.message = "progress: 0 slots (will be set by first candy run)"
-            else:
-                c.status = "warn"
-                c.message = f"progress has {len(pslots)} slots, expected 4 (dynamic)"
-        self.add(c)
+            c.status = "warn"
+            c.message = f"progress has {len(pslots)} slots, expected 4 (dynamic)"
+        return c
 
+    def _check_optimizer_shape(self, optimizer: Optional[dict]) -> Check:
         c = Check(id="schedule.optimizer.shape", category="schedule", severity="detail")
         if not optimizer:
             c.status = "skip"
             c.message = "optimizer plist missing"
+            return c
+        oslots = self._start_slots(optimizer)
+        c.details["slots"] = oslots
+        if all(s[0] == 23 and s[1] == 0 for s in oslots) and 1 <= len(oslots) <= 5:
+            c.status = "pass"
+            c.message = f"optimizer: {len(oslots)} slot(s) at 23:00"
         else:
-            oslots = self._start_slots(optimizer)
-            c.details["slots"] = oslots
-            if all(s[0] == 23 and s[1] == 0 for s in oslots) and 1 <= len(oslots) <= 5:
-                c.status = "pass"
-                c.message = f"optimizer: {len(oslots)} slot(s) at 23:00"
-            else:
-                c.status = "warn"
-                c.message = f"optimizer slots unusual: {oslots}"
-        self.add(c)
+            c.status = "warn"
+            c.message = f"optimizer slots unusual: {oslots}"
+        return c
 
+    def _check_program_args(self, plists: list[Optional[dict]]) -> Check:
         c = Check(id="schedule.plist.program_args", category="schedule", severity="detail")
         pattern = "${JOBS_ROOT:-$HOME/jobs}"
-        bad = []
-        for name in AGENTS:
-            d = self._load_plist(name)
-            if not d:
-                continue
-            args = d.get("ProgramArguments", [])
-            joined = " ".join(str(a) for a in args)
-            if pattern not in joined:
-                bad.append(name)
+        bad = [
+            name
+            for name, d in zip(AGENTS, plists)
+            if d and pattern not in " ".join(str(a) for a in d.get("ProgramArguments", []))
+        ]
         if bad:
             c.status = "warn"
             c.message = f"plists not using {pattern}: {bad}"
         else:
             c.status = "pass"
             c.message = "all plists reference ${JOBS_ROOT:-$HOME/jobs}"
-        self.add(c)
+        return c
 
-    # ----- DETAIL: config files -----
 
-    def check_lunch_conf(self) -> None:
+# ---------------------------------------------------------------------------
+# ConfigChecker — config files + chain state
+# ---------------------------------------------------------------------------
+
+class ConfigChecker:
+    def __init__(self, ctx: DoctorContext) -> None:
+        self.ctx = ctx
+
+    def run(self) -> list[Check]:
+        return [
+            self._check_lunch_conf(),
+            self._check_optimizer_phase(),
+            *self._check_chain_state(),
+        ]
+
+    def _check_lunch_conf(self) -> Check:
         c = Check(id="config.lunch_schedule", category="config", severity="detail")
-        p = self.jobs_root / "config" / "lunch_schedule.conf"
+        p = self.ctx.jobs_root / "config" / "lunch_schedule.conf"
         if not p.exists():
             c.status = "fail"
             c.message = "config/lunch_schedule.conf missing"
             c.fix_policy = "confirm"
             c.fix_command = "run /candy-setup to restore bundle"
-            self.add(c)
-            return
+            return c
         text = p.read_text(errors="replace")
-        has_anchor = bool(re.search(r'^\s*CYCLE_ANCHOR\s*=\s*"?\d{4}-\d{2}-\d{2}', text, re.M))
-        has_pattern = bool(re.search(r'^\s*CYCLE_PATTERN\s*=\s*"?\d{1,2}:\d{2}-\d{1,2}:\d{2}', text, re.M))
+        has_anchor = bool(
+            re.search(r'^\s*CYCLE_ANCHOR\s*=\s*"?\d{4}-\d{2}-\d{2}', text, re.M)
+        )
+        has_pattern = bool(
+            re.search(r'^\s*CYCLE_PATTERN\s*=\s*"?\d{1,2}:\d{2}-\d{1,2}:\d{2}', text, re.M)
+        )
         if has_anchor and has_pattern:
             c.status = "pass"
             c.message = "CYCLE_ANCHOR and CYCLE_PATTERN look valid"
         else:
+            miss = (["CYCLE_ANCHOR (YYYY-MM-DD)"] if not has_anchor else []) + (
+                ["CYCLE_PATTERN (HH:MM-HH:MM,...)"] if not has_pattern else []
+            )
             c.status = "warn"
-            miss = []
-            if not has_anchor:
-                miss.append("CYCLE_ANCHOR (YYYY-MM-DD)")
-            if not has_pattern:
-                miss.append("CYCLE_PATTERN (HH:MM-HH:MM,...)")
             c.message = "lunch_schedule.conf missing or malformed: " + ", ".join(miss)
-        self.add(c)
+            c.fix_policy = "manual"
+            c.fix_command = "edit config/lunch_schedule.conf to add " + " and ".join(miss)
+        return c
 
-    def check_optimizer_phase(self) -> None:
+    def _check_optimizer_phase(self) -> Check:
         c = Check(id="config.optimizer_phase", category="config", severity="detail")
-        p = self.jobs_root / "config" / ".optimizer_phase"
+        p = self.ctx.jobs_root / "config" / ".optimizer_phase"
         if not p.exists():
             c.status = "pass"
             c.message = ".optimizer_phase absent (ok — defaults to phase 1)"
-            self.add(c)
-            return
+            return c
         text = p.read_text(errors="replace").strip()
-        phase = None
+        phase: Optional[int] = None
         try:
             data = json.loads(text)
             if isinstance(data, dict) and data.get("phase") in (1, 2):
@@ -476,58 +625,81 @@ class Doctor:
         else:
             c.status = "warn"
             c.message = f".optimizer_phase has unexpected contents: {text[:80]!r}"
-        self.add(c)
+        return c
 
-    def check_chain_state(self) -> None:
-        morning_p = self.jobs_root / "config" / ".candy_morning_ts"
-        next_p = self.jobs_root / "config" / ".candy_next_ts"
+    def _check_chain_state(self) -> list[Check]:
         now = int(time.time())
 
-        c = Check(id="state.candy_morning_ts", category="config", severity="detail")
-        if not morning_p.exists():
-            c.status = "pass"
-            c.message = ".candy_morning_ts absent (chain mode without morning gate)"
-        else:
+        def _ts_check(
+            cid: str,
+            p: Path,
+            absent_msg: str,
+            future_fmt: str,
+            past_fmt: str,
+        ) -> Check:
+            c = Check(id=cid, category="config", severity="detail")
+            if not p.exists():
+                c.status = "pass"
+                c.message = absent_msg
+                return c
             try:
-                ts = int(morning_p.read_text().strip())
+                ts = int(p.read_text().strip())
                 c.details["ts"] = ts
                 c.details["age_seconds"] = now - ts
-                if ts > now:
-                    c.status = "pass"
-                    c.message = f".candy_morning_ts: 다음 아침까지 {(ts - now)//60}분 남음"
-                else:
-                    c.status = "pass"
-                    c.message = f".candy_morning_ts: 과거 시각 (사용됐거나 stale, age {(now - ts)//60}min)"
+                c.status = "pass"
+                c.message = (
+                    future_fmt.format(mins=(ts - now) // 60)
+                    if ts > now
+                    else past_fmt.format(mins=(now - ts) // 60)
+                )
             except Exception as e:
                 c.status = "warn"
-                c.message = f".candy_morning_ts unreadable: {e}"
-        self.add(c)
+                c.message = f"{p.name} unreadable: {e}"
+            return c
 
-        c = Check(id="state.candy_next_ts", category="config", severity="detail")
-        if not next_p.exists():
-            c.status = "pass"
-            c.message = ".candy_next_ts absent (체인 미시작)"
-        else:
-            try:
-                ts = int(next_p.read_text().strip())
-                c.details["ts"] = ts
-                c.details["age_seconds"] = now - ts
-                if ts > now:
-                    c.status = "pass"
-                    c.message = f".candy_next_ts: 다음 chain까지 {(ts - now)//60}분 남음"
-                else:
-                    c.status = "pass"
-                    c.message = f".candy_next_ts: 과거 (candy가 곧 실행될 예정, age {(now - ts)//60}min)"
-            except Exception as e:
-                c.status = "warn"
-                c.message = f".candy_next_ts unreadable: {e}"
-        self.add(c)
+        cfg = self.ctx.jobs_root / "config"
+        return [
+            _ts_check(
+                "state.candy_morning_ts",
+                cfg / ".candy_morning_ts",
+                ".candy_morning_ts absent (chain mode without morning gate)",
+                ".candy_morning_ts: 다음 아침까지 {mins}분 남음",
+                ".candy_morning_ts: 과거 시각 (사용됐거나 stale, age {mins}min)",
+            ),
+            _ts_check(
+                "state.candy_next_ts",
+                cfg / ".candy_next_ts",
+                ".candy_next_ts absent (체인 미시작)",
+                ".candy_next_ts: 다음 chain까지 {mins}분 남음",
+                ".candy_next_ts: 과거 (candy가 곧 실행될 예정, age {mins}min)",
+            ),
+        ]
 
-    # ----- DETAIL: runtime state -----
 
-    def check_rate_limit_file(self) -> None:
+# ---------------------------------------------------------------------------
+# RuntimeChecker — logs, CSV, rate-limit, optimizer gates, version sync
+# ---------------------------------------------------------------------------
+
+class RuntimeChecker:
+    def __init__(self, ctx: DoctorContext) -> None:
+        self.ctx = ctx
+
+    def run(self) -> list[Check]:
+        return [
+            self._rate_limit_file(),
+            self._refresh_log(),
+            self._usage_csv(),
+            self._limit_until(),
+            self._optimizer_tmp_logs(),
+            self._version_sync(),
+            self._optimizer_gate(),
+            self._optimizer_snap_attribution(),
+            self._optimizer_window_gate(),
+        ]
+
+    def _rate_limit_file(self) -> Check:
         c = Check(id="runtime.rate_limit_file", category="runtime", severity="detail")
-        p = self.home / ".claude" / "abtop-rate-limits.json"
+        p = self.ctx.home / ".claude" / "abtop-rate-limits.json"
         if p.exists():
             try:
                 data = json.loads(p.read_text())
@@ -540,36 +712,39 @@ class Doctor:
         else:
             c.status = "warn"
             c.message = "~/.claude/abtop-rate-limits.json not found (first-day state likely)"
-        self.add(c)
+        return c
 
-    def check_refresh_log(self) -> None:
+    def _refresh_log(self) -> Check:
         c = Check(id="runtime.refresh_log", category="runtime", severity="detail")
-        p = self.jobs_root / "logs" / "refresh.log"
+        p = self.ctx.jobs_root / "logs" / "refresh.log"
         if not p.exists():
             c.status = "warn"
             c.message = "logs/refresh.log not found (candy may never have run)"
-            self.add(c)
-            return
+            return c
         lines = p.read_text(errors="replace").splitlines()
         n = len(lines)
-        errs = [ln for ln in lines[-100:] if re.search(r"\b(error|fatal|traceback)\b", ln, re.I)]
+        errs = [
+            ln for ln in lines[-100:]
+            if re.search(r"\b(error|fatal|traceback)\b", ln, re.I)
+        ]
         if errs:
             c.status = "warn"
-            c.message = f"refresh.log: {len(errs)} error-ish lines in last 100 lines (total {n})"
+            c.message = (
+                f"refresh.log: {len(errs)} error-ish lines in last 100 lines (total {n})"
+            )
             c.details["sample"] = errs[-5:]
         else:
             c.status = "pass"
             c.message = f"refresh.log: {n} lines, no recent errors"
-        self.add(c)
+        return c
 
-    def check_usage_csv(self) -> None:
+    def _usage_csv(self) -> Check:
         c = Check(id="runtime.usage_csv_fresh", category="runtime", severity="detail")
-        p = self.jobs_root / "logs" / "usage_snapshots.csv"
+        p = self.ctx.jobs_root / "logs" / "usage_snapshots.csv"
         if not p.exists():
             c.status = "warn"
             c.message = "logs/usage_snapshots.csv not found"
-            self.add(c)
-            return
+            return c
         last_ts = None
         try:
             with p.open() as f:
@@ -584,16 +759,13 @@ class Doctor:
             if len(tail_lines) <= 1:
                 c.status = "warn"
                 c.message = "usage_snapshots.csv has header only or is empty"
-                self.add(c)
-                return
+                return c
             last = tail_lines[-1]
-            first_field = last.split(",")[0]
-            last_ts = int(first_field)
+            last_ts = int(last.split(",")[0])
         except Exception as e:
             c.status = "warn"
             c.message = f"could not read csv tail: {e}"
-            self.add(c)
-            return
+            return c
         age = int(time.time()) - last_ts
         c.details["last_ts"] = last_ts
         c.details["age_seconds"] = age
@@ -606,16 +778,15 @@ class Doctor:
         else:
             c.status = "warn"
             c.message = f"usage_snapshots.csv very stale: last entry {age//3600} h ago"
-        self.add(c)
+        return c
 
-    def check_limit_until(self) -> None:
+    def _limit_until(self) -> Check:
         c = Check(id="runtime.limit_until", category="runtime", severity="detail")
-        p = self.jobs_root / "logs" / ".limit_until"
+        p = self.ctx.jobs_root / "logs" / ".limit_until"
         if not p.exists():
             c.status = "pass"
             c.message = ".limit_until absent (not in rate-limit state)"
-            self.add(c)
-            return
+            return c
         text = p.read_text(errors="replace").strip()
         try:
             until = int(text)
@@ -630,9 +801,9 @@ class Doctor:
         except Exception:
             c.status = "warn"
             c.message = f".limit_until contents unexpected: {text[:40]!r}"
-        self.add(c)
+        return c
 
-    def check_optimizer_tmp_logs(self) -> None:
+    def _optimizer_tmp_logs(self) -> Check:
         c = Check(id="runtime.optimizer_tmp_logs", category="runtime", severity="detail")
         out_log = Path("/tmp/claude-candy-optimizer.log")
         err_log = Path("/tmp/claude-candy-optimizer-error.log")
@@ -648,16 +819,86 @@ class Doctor:
             c.message = "optimizer tmp logs look clean"
             c.details["out_present"] = out_present
             c.details["err_present"] = err_present
-        self.add(c)
+        return c
 
-    def check_optimizer_gate(self) -> None:
+    def _version_sync(self) -> Check:
+        """deployed (~/.candy_version) vs plugin bundle (.claude-plugin/plugin.json)."""
+        c = Check(id="runtime.version_sync", category="runtime", severity="detail")
+
+        plugin_json: Optional[Path] = None
+        plugin_root = os.environ.get("CLAUDE_PLUGIN_ROOT")
+        if plugin_root:
+            cand = Path(plugin_root) / ".claude-plugin" / "plugin.json"
+            if cand.exists():
+                plugin_json = cand
+        if plugin_json is None:
+            cache_root = self.ctx.home / ".claude" / "plugins" / "cache"
+            if cache_root.exists():
+                for marketplace_dir in cache_root.iterdir():
+                    candy_dir = marketplace_dir / "candy"
+                    if candy_dir.exists():
+                        versions = sorted(
+                            [p for p in candy_dir.iterdir() if p.is_dir()],
+                            key=lambda p: p.name,
+                            reverse=True,
+                        )
+                        if versions:
+                            cand = versions[0] / ".claude-plugin" / "plugin.json"
+                            if cand.exists():
+                                plugin_json = cand
+                                break
+
+        if plugin_json is None:
+            c.status = "skip"
+            c.message = "plugin bundle 위치를 찾을 수 없음 (cache 경로/CLAUDE_PLUGIN_ROOT 모두 미해결)"
+            return c
+
+        try:
+            bundle_version = json.loads(plugin_json.read_text()).get("version", "")
+        except Exception as e:
+            c.status = "warn"
+            c.message = f"plugin.json 파싱 실패: {e}"
+            return c
+
+        deployed_file = self.ctx.jobs_root / ".candy_version"
+        deployed_version = deployed_file.read_text().strip() if deployed_file.exists() else ""
+
+        c.details["bundle_version"] = bundle_version
+        c.details["deployed_version"] = deployed_version
+        c.details["plugin_json"] = str(plugin_json)
+
+        # ~/jobs 가 심링크인 경우 dev mode로 판별.
+        # detect_jobs_root()가 resolve()로 실제 경로를 반환하므로
+        # jobs_root.is_symlink()가 아닌 ~/jobs 자체를 확인한다.
+        jobs_link = self.ctx.home / "jobs"
+        is_dev_link = jobs_link.is_symlink() and jobs_link.resolve() == self.ctx.jobs_root
+
+        if is_dev_link:
+            c.status = "pass"
+            c.message = f"dev mode (~/jobs symlink) — sync 비활성, bundle v{bundle_version}"
+        elif not deployed_version:
+            c.status = "warn"
+            c.message = (
+                f"버전 파일 없음 — 다음 SessionStart 시 자동 sync 예정 (bundle: v{bundle_version})"
+            )
+        elif deployed_version == bundle_version:
+            c.status = "pass"
+            c.message = f"버전 일치: v{bundle_version} ✓"
+        else:
+            c.status = "warn"
+            c.message = (
+                f"버전 불일치 — deployed: v{deployed_version}, bundle: v{bundle_version} "
+                f"(다음 SessionStart 시 자동 sync 예정)"
+            )
+        return c
+
+    def _optimizer_gate(self) -> Check:
         c = Check(id="runtime.optimizer_gate", category="runtime", severity="detail")
-        p = self.jobs_root / "logs" / "usage_snapshots.csv"
+        p = self.ctx.jobs_root / "logs" / "usage_snapshots.csv"
         if not p.exists():
             c.status = "skip"
             c.message = "csv missing"
-            self.add(c)
-            return
+            return c
         try:
             count = 0
             with p.open() as f:
@@ -668,8 +909,7 @@ class Doctor:
                 except ValueError:
                     c.status = "skip"
                     c.message = "csv header missing expected columns"
-                    self.add(c)
-                    return
+                    return c
                 for line in f:
                     parts = line.rstrip("\n").split(",")
                     if len(parts) <= max(type_idx, slot_idx):
@@ -688,22 +928,20 @@ class Doctor:
         except Exception as e:
             c.status = "warn"
             c.message = f"could not evaluate optimizer gate: {e}"
-        self.add(c)
+        return c
 
-    def check_optimizer_snap_attribution(self) -> None:
-        c = Check(id="logic.optimizer_snap_attribution", category="logic", severity="detail")
-        opt_path = self.jobs_root / "bin" / "schedule_optimizer.sh"
+    def _optimizer_snap_attribution(self) -> Check:
+        c = Check(
+            id="logic.optimizer_snap_attribution", category="logic", severity="detail"
+        )
+        opt_path = self.ctx.jobs_root / "bin" / "schedule_optimizer.sh"
         if not opt_path.exists():
             c.status = "skip"
             c.message = "schedule_optimizer.sh not found"
-            self.add(c)
-            return
-
+            return c
         text = opt_path.read_text(errors="replace")
-
         old_pattern = re.compile(r"awk.*\$5.*snapshot.*\$2.*~.*d|awk.*snapshot.*\$2~d")
         new_pattern = re.compile(r"resets_at.*18000|5h_resets_at.*18000")
-
         if old_pattern.search(text):
             c.status = "fail"
             c.message = (
@@ -722,28 +960,24 @@ class Doctor:
         else:
             c.status = "warn"
             c.message = "could not detect snap_count method in schedule_optimizer.sh"
-        self.add(c)
+        return c
 
-    def check_optimizer_window_gate(self) -> None:
-        c = Check(id="runtime.optimizer_window_gate", category="runtime", severity="detail")
-        p = self.jobs_root / "logs" / "usage_snapshots.csv"
+    def _optimizer_window_gate(self) -> Check:
+        c = Check(
+            id="runtime.optimizer_window_gate", category="runtime", severity="detail"
+        )
+        p = self.ctx.jobs_root / "logs" / "usage_snapshots.csv"
         if not p.exists():
             c.status = "skip"
             c.message = "csv missing"
-            self.add(c)
-            return
-
+            return c
         try:
             today = datetime.date.today()
             dow = today.weekday()  # 0=Mon
-            if dow == 0:
-                target = today - datetime.timedelta(days=3)
-            else:
-                target = today - datetime.timedelta(days=1)
+            target = today - datetime.timedelta(days=(3 if dow == 0 else 1))
 
             count_window = 0
             count_date = 0
-
             with p.open() as f:
                 for row in csv.DictReader(f):
                     if row.get("type") != "snapshot":
@@ -764,27 +998,39 @@ class Doctor:
             discrepancy = count_window != count_date
 
             if count_window >= 4:
-                c.status = "pass"
                 msg = f"window-gate open: {count_window}/4 snapshots for {target}"
                 if discrepancy:
                     msg += f" (datetime-only would count {count_date} — cross-day window present)"
-                c.message = msg
+                c.status = "pass"
             else:
-                c.status = "warn"
                 msg = f"window-gate closed: {count_window}/4 snapshots for {target}"
                 if discrepancy:
                     msg += f" (datetime-only: {count_date})"
-                c.message = msg
+                c.status = "warn"
+            c.message = msg
         except Exception as e:
             c.status = "warn"
             c.message = f"could not evaluate window gate: {e}"
-        self.add(c)
+        return c
 
-    # ----- DETAIL: housekeeping -----
 
-    def check_log_sizes(self) -> None:
-        c = Check(id="housekeeping.refresh_log_lines", category="housekeeping", severity="detail")
-        p = self.jobs_root / "logs" / "refresh.log"
+# ---------------------------------------------------------------------------
+# HousekeepingChecker — log sizes + macOS notification permission
+# ---------------------------------------------------------------------------
+
+class HousekeepingChecker:
+    def __init__(self, ctx: DoctorContext) -> None:
+        self.ctx = ctx
+
+    def run(self) -> list[Check]:
+        return [*self._log_sizes(), self._notifications()]
+
+    def _log_sizes(self) -> list[Check]:
+        checks = []
+        c = Check(
+            id="housekeeping.refresh_log_lines", category="housekeeping", severity="detail"
+        )
+        p = self.ctx.jobs_root / "logs" / "refresh.log"
         if p.exists():
             n = sum(1 for _ in p.open(errors="replace"))
             c.details["lines"] = n
@@ -800,10 +1046,12 @@ class Doctor:
         else:
             c.status = "skip"
             c.message = "refresh.log missing"
-        self.add(c)
+        checks.append(c)
 
-        c = Check(id="housekeeping.csv_rows", category="housekeeping", severity="detail")
-        p = self.jobs_root / "logs" / "usage_snapshots.csv"
+        c = Check(
+            id="housekeeping.csv_rows", category="housekeeping", severity="detail"
+        )
+        p = self.ctx.jobs_root / "logs" / "usage_snapshots.csv"
         if p.exists():
             n = sum(1 for _ in p.open(errors="replace"))
             c.details["rows"] = n
@@ -819,10 +1067,12 @@ class Doctor:
         else:
             c.status = "skip"
             c.message = "usage_snapshots.csv missing"
-        self.add(c)
+        checks.append(c)
 
-        c = Check(id="housekeeping.backups_count", category="housekeeping", severity="detail")
-        p = self.jobs_root / "backups"
+        c = Check(
+            id="housekeeping.backups_count", category="housekeeping", severity="detail"
+        )
+        p = self.ctx.jobs_root / "backups"
         if p.exists():
             entries = list(p.iterdir())
             c.details["count"] = len(entries)
@@ -835,11 +1085,10 @@ class Doctor:
         else:
             c.status = "pass"
             c.message = "backups/ does not exist (fine — created on demand)"
-        self.add(c)
+        checks.append(c)
+        return checks
 
-    # ----- DETAIL: notification permissions (manual) -----
-
-    def check_notifications(self) -> None:
+    def _notifications(self) -> Check:
         c = Check(id="os.notification_permission", category="os", severity="detail")
         c.status = "warn"
         c.message = (
@@ -848,33 +1097,91 @@ class Doctor:
             "your terminal have notifications allowed."
         )
         c.fix_policy = "manual"
-        c.fix_command = (
-            "open 'x-apple.systempreferences:com.apple.preference.notifications'"
-        )
-        self.add(c)
+        c.fix_command = "open 'x-apple.systempreferences:com.apple.preference.notifications'"
+        return c
 
-    # ----- DETAIL: execution checks -----
+
+# ---------------------------------------------------------------------------
+# ExecutionChecker — isolated dry-run execution checks
+# ---------------------------------------------------------------------------
+
+class ExecutionChecker:
+    _EXEC_IDS = [
+        "exec.snapshot.dry_run",
+        "exec.progress.dry_run",
+        "exec.optimizer.gate",
+        "exec.chain.gate",
+    ]
+
+    def __init__(self, ctx: DoctorContext) -> None:
+        self.ctx = ctx
+
+    def run(self, no_exec: bool = False) -> list[Check]:
+        if no_exec:
+            return [
+                Check(
+                    id=cid,
+                    category="execution",
+                    severity="detail",
+                    status="skip",
+                    message="--no-exec 플래그로 건너뜀",
+                )
+                for cid in self._EXEC_IDS
+            ]
+
+        today_dow = datetime.date.today().weekday()  # 0=Mon, 6=Sun
+        checks: list[Check] = []
+        try:
+            tmpdir = self._make_exec_tmpdir()
+            if today_dow >= 5:
+                for cid in ("exec.snapshot.dry_run", "exec.progress.dry_run", "exec.optimizer.gate"):
+                    checks.append(Check(
+                        id=cid,
+                        category="execution",
+                        severity="detail",
+                        status="skip",
+                        message="주말 — 스크립트가 weekday-only로 동작",
+                    ))
+            else:
+                checks.append(self._exec_snapshot(tmpdir))
+                checks.append(self._exec_progress(tmpdir))
+                checks.append(self._exec_optimizer_gate(tmpdir))
+            checks.append(self._exec_chain_gate())
+        except Exception as e:
+            for cid in self._EXEC_IDS:
+                if not any(ch.id == cid for ch in checks):
+                    checks.append(Check(
+                        id=cid,
+                        category="execution",
+                        severity="detail",
+                        status="warn",
+                        message=f"execution check 오류: {e}",
+                    ))
+        finally:
+            if "tmpdir" in locals():
+                shutil.rmtree(tmpdir, ignore_errors=True)
+        return checks
 
     def _make_exec_tmpdir(self) -> Path:
-        """격리된 temp JOBS_ROOT 생성. bin/은 심링크, logs/config/는 빈 실제 디렉터리."""
+        """격리된 temp JOBS_ROOT. bin/은 심링크, logs/config/는 빈 실제 디렉터리."""
         tmpdir = Path(tempfile.mkdtemp(prefix="candy_doctor_exec_"))
-        # bin/ 심링크: PYTHONPATH($JOBS_ROOT/bin/lib)가 자동으로 실제 lib을 가리킴
-        (tmpdir / "bin").symlink_to(self.jobs_root / "bin")
-        la_src = self.jobs_root / "LaunchAgents"
+        (tmpdir / "bin").symlink_to(self.ctx.jobs_root / "bin")
+        la_src = self.ctx.jobs_root / "LaunchAgents"
         if la_src.exists():
             (tmpdir / "LaunchAgents").symlink_to(la_src)
         (tmpdir / "logs").mkdir()
         (tmpdir / "config").mkdir()
-        conf_src = self.jobs_root / "config" / "lunch_schedule.conf"
+        conf_src = self.ctx.jobs_root / "config" / "lunch_schedule.conf"
         if conf_src.exists():
             shutil.copy(conf_src, tmpdir / "config" / "lunch_schedule.conf")
         return tmpdir
 
-    def _exec_snapshot_row(self, tmpdir: Path, snapshot_type: str = "snapshot") -> tuple[Check, Optional[dict]]:
+    def _run_script(
+        self, tmpdir: Path, snapshot_type: str
+    ) -> tuple[Check, Optional[dict]]:
         """snapshot 또는 progress 스크립트를 tmpdir에서 실행하고 마지막 CSV 행을 반환."""
         script = "usage_snapshot.sh" if snapshot_type == "snapshot" else "usage_progress.sh"
-        cid = f"exec.{snapshot_type}.dry_run"
-        c = Check(id=cid, category="execution", severity="detail")
+        c = Check(id=f"exec.{snapshot_type}.dry_run", category="execution", severity="detail")
         csv_path = tmpdir / "logs" / "usage_snapshots.csv"
 
         prev_count = 0
@@ -886,45 +1193,37 @@ class Doctor:
         if snapshot_type == "progress":
             env["SNAPSHOT_TYPE"] = "progress"
 
-        rc, out, err = self._run(
-            ["bash", str(self.jobs_root / "bin" / script)],
+        rc, out, err = self.ctx.run_cmd(
+            ["bash", str(self.ctx.jobs_root / "bin" / script)],
             env=env,
             timeout=10,
         )
-
         if rc != 0:
             c.status = "fail"
             c.message = f"{script} exited {rc}: {(out + err).strip()[:200]}"
             return c, None
-
         if not csv_path.exists():
             c.status = "fail"
             c.message = f"{script} 실행됐지만 CSV 미생성"
             return c, None
-
         try:
             rows = list(csv.DictReader(csv_path.open()))
         except Exception as e:
             c.status = "fail"
             c.message = f"CSV 파싱 오류: {e}"
             return c, None
-
         new_rows = rows[prev_count:]
         if not new_rows:
             c.status = "fail"
             c.message = f"{script} 실행됐지만 새 행 없음"
             return c, None
-
         return c, new_rows[-1]
 
-    def _check_exec_snapshot(self, tmpdir: Path) -> None:
-        c, row = self._exec_snapshot_row(tmpdir, "snapshot")
+    def _exec_snapshot(self, tmpdir: Path) -> Check:
+        c, row = self._run_script(tmpdir, "snapshot")
         if row is None:
-            self.add(c)
-            return
-
+            return c
         issues = []
-
         try:
             pct = float(row.get("5h_used_pct", ""))
             if not (0 <= pct <= 100):
@@ -942,81 +1241,73 @@ class Doctor:
                 window_date = window_start.date()
                 today = datetime.date.today()
                 if window_date != today:
-                    issues.append(
-                        f"resetsAt window-start {window_date} ≠ today {today}"
-                    )
+                    issues.append(f"resetsAt window-start {window_date} ≠ today {today}")
                 c.details["window_start"] = str(window_start)
-                c.details["resets_at_human"] = datetime.datetime.fromtimestamp(resets_at).strftime("%H:%M")
+                c.details["resets_at_human"] = datetime.datetime.fromtimestamp(
+                    resets_at
+                ).strftime("%H:%M")
         except (ValueError, TypeError, OSError):
             issues.append("5h_resets_at 파싱 실패")
 
-        c.details["row"] = {k: row.get(k) for k in ("type", "sample_slot", "5h_used_pct", "5h_resets_at")}
-
+        c.details["row"] = {
+            k: row.get(k) for k in ("type", "sample_slot", "5h_used_pct", "5h_resets_at")
+        }
         if issues:
             c.status = "warn"
             c.message = "snapshot.sh 실행됨, 행 기록됨, 그러나: " + "; ".join(issues)
         else:
-            pct_val = row.get("5h_used_pct", "?")
             c.status = "pass"
             c.message = (
-                f"snapshot dry-run 정상: {pct_val}% 사용, "
+                f"snapshot dry-run 정상: {row.get('5h_used_pct', '?')}% 사용, "
                 f"resetsAt window-start={window_date}, "
                 f"resets_at={c.details.get('resets_at_human', '?')}"
             )
-        self.add(c)
+        return c
 
-    def _check_exec_progress(self, tmpdir: Path) -> None:
-        c, row = self._exec_snapshot_row(tmpdir, "progress")
+    def _exec_progress(self, tmpdir: Path) -> Check:
+        c, row = self._run_script(tmpdir, "progress")
         if row is None:
-            self.add(c)
-            return
-
+            return c
         issues = []
         if row.get("type") != "progress":
             issues.append(f"type={row.get('type')!r}, expected 'progress'")
-
-        valid_slots = {"1h", "2h", "3h", "4h"}
         slot = row.get("sample_slot", "")
-        if slot not in valid_slots:
-            issues.append(f"sample_slot={slot!r} (유효값: {valid_slots})")
-
+        if slot not in {"1h", "2h", "3h", "4h"}:
+            issues.append(f"sample_slot={slot!r} (유효값: {{1h,2h,3h,4h}})")
         c.details["row"] = {k: row.get(k) for k in ("type", "sample_slot", "5h_used_pct")}
-
         if issues:
             c.status = "warn"
             c.message = "progress.sh 실행됨, 행 기록됨, 그러나: " + "; ".join(issues)
         else:
             c.status = "pass"
             c.message = f"progress dry-run 정상: slot={slot}, {row.get('5h_used_pct', '?')}% 사용"
-        self.add(c)
+        return c
 
-    def _check_exec_optimizer_gate(self, tmpdir: Path) -> None:
+    def _exec_optimizer_gate(self, tmpdir: Path) -> Check:
         c = Check(id="exec.optimizer.gate", category="execution", severity="detail")
-        optimizer_sh = self.jobs_root / "bin" / "schedule_optimizer.sh"
-
+        optimizer_sh = self.ctx.jobs_root / "bin" / "schedule_optimizer.sh"
         if not optimizer_sh.exists():
             c.status = "skip"
             c.message = "schedule_optimizer.sh not found"
-            self.add(c)
-            return
+            return c
 
         change_log = tmpdir / "logs" / "schedule_changes.log"
         base_env = {
             **os.environ,
             "JOBS_ROOT": str(tmpdir),
-            "PYTHONPATH": str(self.jobs_root / "bin" / "lib"),
+            "PYTHONPATH": str(self.ctx.jobs_root / "bin" / "lib"),
         }
-
         failures = []
 
-        # 케이스 1: 주말(토요일) → "주말 스킵"
         today = datetime.date.today()
-        days_to_sat = (5 - today.weekday()) % 7 or 7  # 항상 미래의 토요일
-        saturday = today + datetime.timedelta(days=days_to_sat)
-        sat_ts = int(datetime.datetime.combine(saturday, datetime.time(23, 0)).timestamp())
-
+        days_to_sat = (5 - today.weekday()) % 7 or 7
+        sat_ts = int(
+            datetime.datetime.combine(
+                today + datetime.timedelta(days=days_to_sat), datetime.time(23, 0)
+            ).timestamp()
+        )
         change_log.write_text("")
-        rc, _, _ = self._run(
+        rc, _, _ = self.ctx.run_cmd(
             ["bash", str(optimizer_sh)],
             env={**base_env, "FAKE_NOW_TS": str(sat_ts)},
             timeout=15,
@@ -1027,13 +1318,14 @@ class Doctor:
         elif "주말 스킵" not in log_text:
             failures.append(f"주말 케이스: '주말 스킵' 로그 없음 ({log_text.strip()[:80]!r})")
 
-        # 케이스 2: 평일 + 데이터 없음 → "SKIP - 데이터 부족"
-        days_to_tue = (1 - today.weekday()) % 7 or 7  # 다음 화요일
-        tuesday = today + datetime.timedelta(days=days_to_tue)
-        tue_ts = int(datetime.datetime.combine(tuesday, datetime.time(23, 0)).timestamp())
-
+        days_to_tue = (1 - today.weekday()) % 7 or 7
+        tue_ts = int(
+            datetime.datetime.combine(
+                today + datetime.timedelta(days=days_to_tue), datetime.time(23, 0)
+            ).timestamp()
+        )
         change_log.write_text("")
-        rc, _, _ = self._run(
+        rc, _, _ = self.ctx.run_cmd(
             ["bash", str(optimizer_sh)],
             env={**base_env, "FAKE_NOW_TS": str(tue_ts)},
             timeout=15,
@@ -1050,10 +1342,10 @@ class Doctor:
         else:
             c.status = "pass"
             c.message = "optimizer gate 정상: 주말→스킵, 데이터부족→스킵 확인"
-        self.add(c)
+        return c
 
-    def _check_exec_chain_gate(self) -> None:
-        """refresh_claude.sh GATE_PYEOF 로직을 Python으로 직접 재현해 3개 케이스 검증."""
+    def _exec_chain_gate(self) -> Check:
+        """refresh_claude.sh GATE_PYEOF 로직을 Python으로 재현해 3개 케이스 검증."""
         c = Check(id="exec.chain.gate", category="execution", severity="detail")
         now_ts = int(time.time())
         future_ts = now_ts + 3600
@@ -1071,86 +1363,46 @@ class Doctor:
             ("morning_ts 미래 → blocked", gate(future_ts, 0), "blocked"),
             ("둘 다 과거 → pass", gate(past_ts, past_ts), "pass"),
         ]
-
         failures = [label for label, actual, expected in cases if actual != expected]
-
         if failures:
             c.status = "fail"
             c.message = "chain gate 로직 오류: " + ", ".join(failures)
         else:
             c.status = "pass"
-            c.message = "chain gate 정상: next_ts미래→blocked, morning_ts미래→blocked, 둘다과거→pass"
-        self.add(c)
+            c.message = (
+                "chain gate 정상: next_ts미래→blocked, morning_ts미래→blocked, 둘다과거→pass"
+            )
+        return c
 
-    def check_execution(self, no_exec: bool = False) -> None:
-        """실제 스크립트 실행 검증 (격리된 temp JOBS_ROOT 사용)."""
-        exec_check_ids = [
-            "exec.snapshot.dry_run",
-            "exec.progress.dry_run",
-            "exec.optimizer.gate",
-            "exec.chain.gate",
-        ]
 
-        if no_exec:
-            for cid in exec_check_ids:
-                self.add(Check(
-                    id=cid, category="execution", severity="detail",
-                    status="skip", message="--no-exec 플래그로 건너뜀",
-                ))
-            return
+# ---------------------------------------------------------------------------
+# Doctor — thin orchestrator
+# ---------------------------------------------------------------------------
 
-        today_dow = datetime.date.today().weekday()  # 0=Mon, 6=Sun
-        tmpdir = self._make_exec_tmpdir()
-        try:
-            if today_dow >= 5:
-                # 주말: snapshot/progress/optimizer는 weekday-only 동작 → skip
-                for cid in ("exec.snapshot.dry_run", "exec.progress.dry_run", "exec.optimizer.gate"):
-                    self.add(Check(
-                        id=cid, category="execution", severity="detail",
-                        status="skip", message="주말 — 스크립트가 weekday-only로 동작",
-                    ))
-            else:
-                self._check_exec_snapshot(tmpdir)
-                self._check_exec_progress(tmpdir)
-                self._check_exec_optimizer_gate(tmpdir)
-            # chain gate는 순수 Python — 항상 실행
-            self._check_exec_chain_gate()
-        except Exception as e:
-            for cid in exec_check_ids:
-                if not any(ch.id == cid for ch in self.checks):
-                    self.add(Check(
-                        id=cid, category="execution", severity="detail",
-                        status="warn", message=f"execution check 오류: {e}",
-                    ))
-        finally:
-            shutil.rmtree(tmpdir, ignore_errors=True)
+class Doctor:
+    def __init__(self, jobs_root: Path) -> None:
+        self.ctx = make_context(jobs_root)
 
-    # ----- run all -----
+    @property
+    def uid(self) -> int:
+        return self.ctx.uid
 
-    def run_all(self, no_exec: bool = False) -> None:
-        self.check_binaries()
-        self.check_gui_session()
-        self.check_jobs_root()
-        self.check_bin_executables()
-        self.check_launchagent_files()
-        self.check_agent_registration()
-        self.check_claude_preflight()
-        self.check_schedule()
-        self.check_lunch_conf()
-        self.check_optimizer_phase()
-        self.check_chain_state()
-        self.check_rate_limit_file()
-        self.check_refresh_log()
-        self.check_usage_csv()
-        self.check_limit_until()
-        self.check_optimizer_tmp_logs()
-        self.check_optimizer_gate()
-        self.check_optimizer_snap_attribution()
-        self.check_optimizer_window_gate()
-        self.check_log_sizes()
-        self.check_execution(no_exec=no_exec)
-        self.check_notifications()
+    def run_all(self, no_exec: bool = False) -> list[Check]:
+        checks: list[Check] = []
+        checks.extend(BinaryAuthChecker(self.ctx).run())
+        checks.extend(FilesystemChecker(self.ctx).run())
+        checks.extend(LaunchDChecker(self.ctx).run())
+        checks.extend(ScheduleChecker(self.ctx).run())
+        checks.extend(ConfigChecker(self.ctx).run())
+        checks.extend(RuntimeChecker(self.ctx).run())
+        checks.extend(HousekeepingChecker(self.ctx).run())
+        checks.extend(ExecutionChecker(self.ctx).run(no_exec=no_exec))
+        return checks
 
+
+# ---------------------------------------------------------------------------
+# JOBS_ROOT detection
+# ---------------------------------------------------------------------------
 
 def detect_jobs_root() -> Path:
     env = os.environ.get("JOBS_ROOT")
@@ -1165,34 +1417,22 @@ def detect_jobs_root() -> Path:
     return home / "jobs"
 
 
-def render_human(jobs_root: Path, checks: list[Check]) -> str:
-    out = []
-    out.append("Candy Doctor Report")
-    out.append(f"JOBS_ROOT: {jobs_root}")
-    out.append("")
+# ---------------------------------------------------------------------------
+# Human-readable renderer
+# ---------------------------------------------------------------------------
 
+def render_human(jobs_root: Path, checks: list[Check]) -> str:
+    out = ["Candy Doctor Report", f"JOBS_ROOT: {jobs_root}", ""]
     by_cat: dict[str, list[Check]] = {}
     for c in checks:
         by_cat.setdefault(c.category, []).append(c)
 
-    summary = {"pass": 0, "warn": 0, "fail": 0, "skip": 0}
-    for c in checks:
-        summary[c.status] = summary.get(c.status, 0) + 1
+    summary = {s: sum(1 for c in checks if c.status == s) for s in ("pass", "warn", "fail", "skip")}
 
-    for cat in [
-        "binary",
-        "env",
-        "auth",
-        "filesystem",
-        "launchd",
-        "schedule",
-        "config",
-        "runtime",
-        "logic",
-        "execution",
-        "housekeeping",
-        "os",
-    ]:
+    for cat in (
+        "binary", "env", "auth", "filesystem", "launchd",
+        "schedule", "config", "runtime", "logic", "execution", "housekeeping", "os",
+    ):
         items = by_cat.get(cat)
         if not items:
             continue
@@ -1212,6 +1452,10 @@ def render_human(jobs_root: Path, checks: list[Check]) -> str:
     return "\n".join(out)
 
 
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
+
 def main() -> int:
     ap = argparse.ArgumentParser(description="Diagnose Claude Candy installation")
     ap.add_argument("--jobs-root", help="override JOBS_ROOT (default: inferred)")
@@ -1230,25 +1474,23 @@ def main() -> int:
     )
 
     doc = Doctor(jobs_root=jobs_root)
-    doc.run_all(no_exec=args.no_exec)
+    checks = doc.run_all(no_exec=args.no_exec)
 
     if args.json:
         payload = {
             "jobs_root": str(jobs_root),
             "uid": doc.uid,
-            "checks": [asdict(c) for c in doc.checks],
+            "checks": [asdict(c) for c in checks],
             "summary": {
-                "pass": sum(1 for c in doc.checks if c.status == "pass"),
-                "warn": sum(1 for c in doc.checks if c.status == "warn"),
-                "fail": sum(1 for c in doc.checks if c.status == "fail"),
-                "skip": sum(1 for c in doc.checks if c.status == "skip"),
+                s: sum(1 for c in checks if c.status == s)
+                for s in ("pass", "warn", "fail", "skip")
             },
         }
         print(json.dumps(payload, ensure_ascii=False, indent=2))
     else:
-        print(render_human(jobs_root, doc.checks))
+        print(render_human(jobs_root, checks))
 
-    must_fail = any(c.status == "fail" and c.severity == "must" for c in doc.checks)
+    must_fail = any(c.status == "fail" and c.severity == "must" for c in checks)
     return 1 if must_fail else 0
 
 
