@@ -566,6 +566,7 @@ class ConfigChecker:
     def run(self) -> list[Check]:
         return [
             self._check_lunch_conf(),
+            self._check_work_start(),
             self._check_optimizer_phase(),
             *self._check_chain_state(),
         ]
@@ -597,6 +598,56 @@ class ConfigChecker:
             c.message = "lunch_schedule.conf missing or malformed: " + ", ".join(miss)
             c.fix_policy = "manual"
             c.fix_command = "edit config/lunch_schedule.conf to add " + " and ".join(miss)
+        return c
+
+    def _check_work_start(self) -> Check:
+        """출근 시간 (pre-warm hard constraint) 검증.
+
+        v0.4.0 부터 lunch_schedule.conf 에 WORK_START_HOUR/MIN 키 도입.
+        구버전 conf 를 가진 사용자는 키가 빠진 채 sync 됨 → optimizer 는 fallback
+        9:00 으로 동작하지만, 실제 출근 시간이 다르면 pre-warm 이 잘못 잡혀 토큰 낭비.
+        """
+        c = Check(id="config.work_start", category="config", severity="detail")
+        p = self.ctx.jobs_root / "config" / "lunch_schedule.conf"
+        if not p.exists():
+            c.status = "skip"
+            c.message = "skipped (lunch_schedule.conf missing — see config.lunch_schedule)"
+            return c
+        text = p.read_text(errors="replace")
+        m_h = re.search(r'^\s*WORK_START_HOUR\s*=\s*"?(\d+)', text, re.M)
+        m_m = re.search(r'^\s*WORK_START_MIN\s*=\s*"?(\d+)', text, re.M)
+        if not m_h or not m_m:
+            missing = []
+            if not m_h:
+                missing.append("WORK_START_HOUR")
+            if not m_m:
+                missing.append("WORK_START_MIN")
+            c.status = "warn"
+            c.message = (
+                f"{', '.join(missing)} 누락 — optimizer 는 fallback 09:00 으로 동작. "
+                "실제 출근 시각이 다르면 pre-warm 이 잘못 잡힘."
+            )
+            c.fix_policy = "confirm"
+            c.fix_command = (
+                "/candy:candy-setup 재실행 (권장) 또는 "
+                f"{p} 에 'WORK_START_HOUR=<H>' 'WORK_START_MIN=<M>' 두 줄 추가"
+            )
+            return c
+        h = int(m_h.group(1))
+        m = int(m_m.group(1))
+        if not (0 <= h <= 23 and 0 <= m <= 59):
+            c.status = "warn"
+            c.message = (
+                f"WORK_START_HOUR={h}, WORK_START_MIN={m} 가 유효 범위 밖. "
+                "optimizer 는 fallback 09:00 으로 동작."
+            )
+            c.fix_policy = "confirm"
+            c.fix_command = "/candy:candy-setup 재실행 또는 conf 직접 수정"
+            return c
+        c.status = "pass"
+        c.message = f"WORK_START={h:02d}:{m:02d} (pre-warm 유효 범위: ({h - 5 if h >= 5 else h + 19:02d}:{m:02d}, {h:02d}:{m:02d}])"
+        c.details["work_start_hour"] = h
+        c.details["work_start_min"] = m
         return c
 
     def _check_optimizer_phase(self) -> Check:
