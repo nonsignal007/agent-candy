@@ -86,12 +86,22 @@ execution dry-run 까지 돌면 5초 정도 더 걸린다. 빠른 정적 진단�
 
 **안전 룰**: confirm 항목이 3개 이상 한꺼번에 뜨면, 개별 수정보다 **"`/candy-setup` 을 다시 돌리세요"** 를 먼저 권한다. 부분 수정을 여러 번 하는 것보다 번들을 통째로 재배포하는 게 훨씬 깔끔하기 때문이다.
 
+#### 인터랙티브 검증 (`details.interactive=true`)
+
+`os.notification_permission` 같이 코드만으로 결과를 검증할 수 없는 항목은 `details.interactive=true` 가 붙는다. 이 경우 일반 confirm 묶음과 **분리해서** 다음 흐름으로 처리한다:
+
+1. fix_command 를 실행 (예: 테스트 알림 발송)
+2. 사용자에게 결과를 직접 묻는다 — "방금 알림 받으셨나요?" 같이 명확하게
+3. **사용자가 yes** → 정상으로 처리하고 보고에 "사용자 확인 완료" 로 기록
+4. **사용자가 no** → `details.fallback_command` 를 실행 (예: System Settings 알림 패널 열기) 후, candy-setup 의 8a/8b 단계 안내 (스크립트 편집기 1회 실행 + 알림 허용)
+
+이 항목은 **사용자 답변 자체가 곧 검증** 이므로 무시하거나 묶음 yes/no 한방 처리하면 안 된다.
+
 ### 🔴 manual — 수동 조치
 
 사용자가 직접 해야 한다. Claude 가 할 수 있는 건 **정확히 어떤 설정을 어떻게 바꿔야 하는지** 알려주는 것뿐이다. 흔한 케이스:
 
 - Claude CLI 로그인 만료 → "터미널에서 `claude` 실행 후 로그인"
-- macOS 알림 권한 → "시스템 설정 > 알림 > osascript / 터미널 허용"
 - 바이너리 자체 누락 → "먼저 `python3` / `claude` 설치"
 - rate limit 활성 (`.limit_until` 살아 있음) → "해당 시간까지 기다림"
 

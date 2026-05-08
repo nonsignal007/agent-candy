@@ -943,6 +943,23 @@ class RuntimeChecker:
             )
         return c
 
+    def _read_min_snapshots(self) -> int:
+        """schedule_optimizer.sh 의 MIN_SNAPSHOTS 기본값을 동적으로 읽어온다.
+
+        파싱 실패 / 파일 부재 시 3 으로 fallback (현재 optimizer 의 기본).
+        """
+        p = self.ctx.jobs_root / "bin" / "schedule_optimizer.sh"
+        if not p.exists():
+            return 3
+        try:
+            text = p.read_text(errors="replace")
+            m = re.search(r'MIN_SNAPSHOTS=\$\{MIN_SNAPSHOTS:-(\d+)\}', text)
+            if m:
+                return int(m.group(1))
+        except Exception:
+            pass
+        return 3
+
     def _optimizer_gate(self) -> Check:
         c = Check(id="runtime.optimizer_gate", category="runtime", severity="detail")
         p = self.ctx.jobs_root / "logs" / "usage_snapshots.csv"
@@ -950,6 +967,7 @@ class RuntimeChecker:
             c.status = "skip"
             c.message = "csv missing"
             return c
+        min_snap = self._read_min_snapshots()
         try:
             count = 0
             with p.open() as f:
@@ -968,13 +986,14 @@ class RuntimeChecker:
                     if parts[type_idx] == "snapshot" and parts[slot_idx] == "final":
                         count += 1
             c.details["final_snapshots"] = count
-            if count >= 4:
+            c.details["min_snapshots"] = min_snap
+            if count >= min_snap:
                 c.status = "pass"
-                c.message = f"optimizer gate open: {count} final snapshots accumulated (≥ 4)"
+                c.message = f"optimizer gate open: {count} final snapshots accumulated (≥ {min_snap})"
             else:
                 c.status = "warn"
                 c.message = (
-                    f"optimizer gate closed: {count}/4 final snapshots — optimizer will skip"
+                    f"optimizer gate closed: {count}/{min_snap} final snapshots — optimizer will skip"
                 )
         except Exception as e:
             c.status = "warn"
@@ -994,10 +1013,12 @@ class RuntimeChecker:
         old_pattern = re.compile(r"awk.*\$5.*snapshot.*\$2.*~.*d|awk.*snapshot.*\$2~d")
         new_pattern = re.compile(r"resets_at.*18000|5h_resets_at.*18000")
         if old_pattern.search(text):
+            min_snap = self._read_min_snapshots()
             c.status = "fail"
             c.message = (
                 "schedule_optimizer.sh snap_count uses awk date-match — "
-                "snapshots crossing midnight are not counted (optimizer stuck at 3/4)"
+                f"snapshots crossing midnight are not counted "
+                f"(optimizer stuck at {max(0, min_snap - 1)}/{min_snap})"
             )
             c.fix_policy = "manual"
             c.fix_command = (
@@ -1022,6 +1043,7 @@ class RuntimeChecker:
             c.status = "skip"
             c.message = "csv missing"
             return c
+        min_snap = self._read_min_snapshots()
         try:
             today = datetime.date.today()
             dow = today.weekday()  # 0=Mon
@@ -1046,15 +1068,16 @@ class RuntimeChecker:
             c.details["target_date"] = str(target)
             c.details["count_by_window_start"] = count_window
             c.details["count_by_datetime"] = count_date
+            c.details["min_snapshots"] = min_snap
             discrepancy = count_window != count_date
 
-            if count_window >= 4:
-                msg = f"window-gate open: {count_window}/4 snapshots for {target}"
+            if count_window >= min_snap:
+                msg = f"window-gate open: {count_window}/{min_snap} snapshots for {target}"
                 if discrepancy:
                     msg += f" (datetime-only would count {count_date} — cross-day window present)"
                 c.status = "pass"
             else:
-                msg = f"window-gate closed: {count_window}/4 snapshots for {target}"
+                msg = f"window-gate closed: {count_window}/{min_snap} snapshots for {target}"
                 if discrepancy:
                     msg += f" (datetime-only: {count_date})"
                 c.status = "warn"
@@ -1140,15 +1163,29 @@ class HousekeepingChecker:
         return checks
 
     def _notifications(self) -> Check:
+        """macOS 알림 권한은 코드로 검증 불가 → 사용자 인터랙티브 확인.
+
+        Doctor SKILL 의 confirm 정책으로 Claude 가:
+        1) fix_command 의 osascript 로 테스트 알림을 보내고
+        2) 사용자에게 "받으셨나요?" 묻고
+        3) 못 받았으면 System Settings 안내 (candy-setup 8a/8b 참고)
+        """
         c = Check(id="os.notification_permission", category="os", severity="detail")
         c.status = "warn"
         c.message = (
-            "macOS notification permission can't be reliably read programmatically. "
-            "Verify in System Settings → Notifications that osascript / Script Editor / "
-            "your terminal have notifications allowed."
+            "macOS 알림 권한은 자동 검증 불가. 테스트 알림을 보내고 사용자에게 "
+            "받았는지 직접 확인 필요. (받았다고 답하면 정상, 못 받았으면 System "
+            "Settings → 알림 → 스크립트 편집기 권한 허용 안내)"
         )
-        c.fix_policy = "manual"
-        c.fix_command = "open 'x-apple.systempreferences:com.apple.preference.notifications'"
+        c.fix_policy = "confirm"
+        c.fix_command = (
+            "osascript -e 'display notification \"candy-doctor 알림 권한 테스트입니다\" "
+            "with title \"Claude Candy\" subtitle \"권한 검증\"'"
+        )
+        c.details["fallback_command"] = (
+            "open 'x-apple.systempreferences:com.apple.preference.notifications'"
+        )
+        c.details["interactive"] = True
         return c
 
 
