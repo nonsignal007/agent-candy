@@ -28,18 +28,19 @@ Candy 설치는 symlink 걸기만으로 끝나지 않는다:
 
 ## 전체 흐름
 
-다음 10단계를 순서대로 실행한다.
+다음 11단계를 순서대로 실행한다.
 
 1. JOBS_ROOT 경로 결정 (사용자 확인)
 2. 요구 사항 검증 (`claude`, `python3`, `launchctl`, `plutil`, `osascript`)
 3. Claude CLI preflight (`claude -p --output-format json`)
 4. 플러그인 번들을 JOBS_ROOT로 복사 배포
-5. `~/Library/LaunchAgents` symlink 생성
-6. Bootout → Bootstrap
-7. **스크립트 편집기 1회 실행 + 알림 권한 설정 + 가상 알림 검증 (사용자 확인 포인트)**
-8. `launchctl print`로 4개 agent 검증
-9. 가상 회귀 테스트 (`tests/virtual_time_test.sh`) 실행
-10. Live smoke 실행 여부 사용자에게 확인 (옵션)
+5. **점심 시간 설정 (`config/lunch_schedule.conf` — 사용자 확인 포인트)**
+6. `~/Library/LaunchAgents` symlink 생성
+7. Bootout → Bootstrap
+8. **스크립트 편집기 1회 실행 + 알림 권한 설정 + 가상 알림 검증 (사용자 확인 포인트)**
+9. `launchctl print`로 4개 agent 검증
+10. 가상 회귀 테스트 (`tests/virtual_time_test.sh`) 실행
+11. Live smoke 실행 여부 사용자에게 확인 (옵션)
 
 각 단계에서 실패하면 멈추고, 원인과 다음 행동을 사용자에게 알린다.
 
@@ -113,7 +114,104 @@ mkdir -p "$JOBS_ROOT/logs" "$JOBS_ROOT/backups"
 
 주의: `logs/`, `config/.optimizer_phase`, `backups/` 는 절대 덮어쓰지 않는다. 기존 운영 기록이 날아간다.
 
-### 5. LaunchAgent symlinks 생성
+### 5. 점심 시간 설정 — 사용자 확인 포인트
+
+Candy 의 핵심 목적은 **점심시간을 5시간 윈도우 안에 포함시키는 것**이다. optimizer 는 `$JOBS_ROOT/config/lunch_schedule.conf` 의 점심 시간대를 보고 다음 아침 pre-warm 시각을 계산한다. 이 값이 사용자의 실제 점심 시간과 다르면 자동화의 의미가 사라지므로, setup 시점에 반드시 확인을 받는다.
+
+```
+CYCLE_ANCHOR="YYYY-MM-DD"          # 패턴 첫 항목이 적용되는 기준 주의 임의 날짜
+CYCLE_PATTERN="HH:MM-HH:MM,..."    # 쉼표 구분, 1~N개 시간대. N주 단위 순환
+```
+
+#### 5a. 기존 설정 확인
+
+`$JOBS_ROOT/config/lunch_schedule.conf` 가 이미 있고 1단계에서 "그대로 둠" 을 선택했다면, 현재 값을 사용자에게 보여준다:
+
+```bash
+grep -E '^(CYCLE_ANCHOR|CYCLE_PATTERN)=' "$JOBS_ROOT/config/lunch_schedule.conf"
+```
+
+> "현재 점심 설정은 다음과 같습니다.
+>
+> - ANCHOR: `2026-04-13`
+> - PATTERN: `12:30-13:30, 12:00-13:00, 13:00-14:00`
+>
+> 이대로 둘까요? 변경할까요?"
+
+"그대로" 를 선택하면 이 단계 종료. "변경" 이면 5b 진행.
+
+신규 설치 / 덮어쓰기 인 경우는 항상 5b 부터 진행한다 (번들 기본값을 덮어쓰는 흐름).
+
+#### 5b. 점심 패턴 결정
+
+사용자에게 다음 세 가지 옵션을 제시한다:
+
+> "점심 시간을 알려주세요. Candy 는 이 시간대를 5시간 윈도우 안에 포함시키도록 pre-warm 시각을 계산합니다.
+>
+> 1. **매일 같은 시간** (예: `12:00-13:00`) — 가장 일반적
+> 2. **주별로 순환** (예: 1주차 `12:30-13:30`, 2주차 `12:00-13:00`, 3주차 `13:00-14:00`) — 점심 시간이 주별로 바뀌는 회사
+> 3. **직접 입력** — `HH:MM-HH:MM` 형식, 쉼표로 여러 개
+>
+> 어떻게 하시겠어요?"
+
+옵션별 후속 질문:
+
+- **옵션 1**: "점심 시간을 알려주세요 (`HH:MM-HH:MM`)." → 한 항목짜리 PATTERN 으로 사용
+- **옵션 2**: "1주차부터 순서대로 점심 시간을 알려주세요. 보통 2~4개입니다." → 모두 받아 쉼표로 결합
+- **옵션 3**: 자유 입력을 그대로 받음
+
+검증:
+
+```python
+import re
+ITEM_RE = re.compile(r'^([01]?\d|2[0-3]):[0-5]\d-([01]?\d|2[0-3]):[0-5]\d$')
+for item in pattern.split(','):
+    item = item.strip()
+    assert ITEM_RE.match(item), f"형식 오류: {item}"
+    s, e = item.split('-')
+    assert s < e, f"시작이 종료보다 늦거나 같음: {item}"
+```
+
+검증 실패 시 사용자에게 어느 항목이 왜 잘못됐는지 보여주고 다시 입력받는다.
+
+#### 5c. ANCHOR 결정
+
+- **옵션 1 (단일 시간)**: ANCHOR 는 의미가 없으므로 오늘 날짜로 둔다.
+- **옵션 2/3 (다항목)**: 1주차 패턴이 적용될 주를 정해야 한다.
+
+> "방금 입력하신 패턴의 **첫 번째 시간 (`<첫 항목>`)** 이 적용되는 주는 언제인가요? 그 주에 속한 임의 날짜를 `YYYY-MM-DD` 로 알려주세요. 기본값은 오늘 날짜 (`<오늘>`) 입니다."
+
+검증: `datetime.date.fromisoformat()` 로 파싱 가능해야 한다.
+
+#### 5d. conf 파일 작성
+
+확정된 값으로 conf 파일을 작성한다 (기존 파일 덮어쓰기):
+
+```bash
+cat > "$JOBS_ROOT/config/lunch_schedule.conf" <<EOF
+# Claude Candy 점심 시간 로테이션 설정
+# 매주 업데이트 or N주 순환 자동 계산
+#
+# CYCLE_ANCHOR: 이 날짜가 속한 주의 점심 = CYCLE_PATTERN 첫 번째 값
+# CYCLE_PATTERN: 쉼표 구분, N주 순환 (HH:MM-HH:MM)
+
+CYCLE_ANCHOR="$ANCHOR"
+CYCLE_PATTERN="$PATTERN"
+EOF
+```
+
+작성 후 사용자에게 최종 결과를 다시 보여주고 한 번 더 확인한다:
+
+> "다음 내용으로 `$JOBS_ROOT/config/lunch_schedule.conf` 를 작성했습니다.
+>
+> - ANCHOR: `<ANCHOR>` (이 주에 첫 번째 패턴 적용)
+> - PATTERN: `<PATTERN>`
+>
+> 이대로 진행할까요?"
+
+"틀렸다" 고 하면 5b 부터 다시 받는다.
+
+### 6. LaunchAgent symlinks 생성
 
 ```bash
 mkdir -p ~/Library/LaunchAgents
@@ -126,7 +224,7 @@ done
 
 `ln -sfn` 이므로 기존 symlink가 있어도 안전하게 덮어쓴다.
 
-### 6. Bootout → Bootstrap
+### 7. Bootout → Bootstrap
 
 기존 등록을 먼저 해제한다. 등록이 안 돼 있어도 에러를 무시한다:
 
@@ -144,7 +242,7 @@ bootstrap 실패 시 멈추고 사용자에게 알린다. 흔한 원인: plist �
 
 **JOBS_ROOT 가 기본(`~/jobs`) 이 아닌 경우 주의**: plist는 `${JOBS_ROOT:-$HOME/jobs}` 를 읽지만 launchd 는 셸 env를 상속하지 않는다. 따라서 기본값이 아닌 JOBS_ROOT 를 쓴다면, 사용자에게 "현재 plist는 `$HOME/jobs` 를 기본값으로 사용하므로 JOBS_ROOT가 다른 경우 plist의 `EnvironmentVariables` 를 직접 수정해야 합니다" 라고 알리고 사용자 동의를 받은 뒤에만 plist를 편집한다. 기본 경로(`~/jobs`) 를 쓰면 이 문제는 없다.
 
-### 7. 스크립트 편집기 1회 실행 + 알림 권한 설정 + 가상 알림 검증 — 사용자 확인 포인트
+### 8. 스크립트 편집기 1회 실행 + 알림 권한 설정 + 가상 알림 검증 — 사용자 확인 포인트
 
 **이 스킬의 가장 중요한 사용자 확인 포인트.** 자동화할 수 없는 부분이 있다.
 
@@ -155,7 +253,7 @@ Candy의 `refresh_claude.sh` / `schedule_optimizer.sh` 는 결과를 `osascript 
 
 이 단계는 그래서 4개 하위 단계로 나뉜다.
 
-#### 7a. 스크립트 편집기 1회 실행
+#### 8a. 스크립트 편집기 1회 실행
 
 Claude 가 직접 띄울 수 있다:
 
@@ -169,7 +267,7 @@ open -a "Script Editor"
 
 사용자가 "떴어요" / "확인" 등으로 긍정 응답할 때까지 기다린다. 안 뜬다고 하면 응용프로그램 폴더에서 직접 실행하도록 안내한다.
 
-#### 7b. 알림 권한 설정 안내
+#### 8b. 알림 권한 설정 안내
 
 알림 패널을 직접 열어준다:
 
@@ -181,13 +279,13 @@ open "x-apple.systempreferences:com.apple.preference.notifications"
 
 > "시스템 설정의 알림 패널을 열었습니다.
 >
-> 1. 앱 목록에서 **스크립트 편집기(Script Editor)** 항목을 찾으세요. (방금 7a 에서 실행했으므로 목록에 있어야 합니다. 없다면 7a 로 돌아가 다시 실행하세요.)
+> 1. 앱 목록에서 **스크립트 편집기(Script Editor)** 항목을 찾으세요. (방금 8a 에서 실행했으므로 목록에 있어야 합니다. 없다면 8a 로 돌아가 다시 실행하세요.)
 > 2. 그 항목을 클릭하고 **알림 허용** 을 켭니다.
 > 3. 알림 스타일은 **배너** 또는 **알림 센터** 중 원하는 대로 선택합니다.
 >
 > 설정이 끝났으면 '완료' 라고 알려주세요."
 
-#### 7c. 가상 알림 실행
+#### 8c. 가상 알림 실행
 
 알림 권한이 실제로 작동하는지는 종료 코드로 확인할 수 없다 — macOS 는 권한이 없을 때도 osascript 에 0 을 반환한다. 그래서 setup 도중에 진짜 알림을 한 번 띄워서 사용자 눈으로 확인해야 한다.
 
@@ -197,7 +295,7 @@ osascript -e 'display notification "Candy 알림 테스트입니다" with title 
 
 이 명령은 즉시 알림 센터에 띄워야 한다.
 
-#### 7d. 알림 표시 확인 — 사용자 확인 포인트
+#### 8d. 알림 표시 확인 — 사용자 확인 포인트
 
 사용자에게 명확하게 묻는다:
 
@@ -208,17 +306,17 @@ osascript -e 'display notification "Candy 알림 테스트입니다" with title 
 > > Candy 알림 테스트입니다
 >
 > - 떴어요 → 알림 설정 OK, 다음 단계로 진행
-> - 안 떴어요 → 7a/7b 로 돌아가서 스크립트 편집기 실행 + 권한 허용 재확인"
+> - 안 떴어요 → 8a/8b 로 돌아가서 스크립트 편집기 실행 + 권한 허용 재확인"
 
-사용자가 "안 떴다" 고 답하면 7a/7b 부터 다시 안내한다. 1회 재시도까지 기다리고, 그래도 안 뜨면:
+사용자가 "안 떴다" 고 답하면 8a/8b 부터 다시 안내한다. 1회 재시도까지 기다리고, 그래도 안 뜨면:
 
 - 진행은 하되, "Candy 자체 동작은 정상이지만 알림은 뜨지 않을 수 있다" 고 명시한다.
 - README 의 Troubleshooting / 알림 섹션을 가리킨다.
-- 흔한 원인: 집중 모드(Do Not Disturb) 활성화, 화면 잠금 중에는 잠금 해제 후 알림 센터에 누적, 스크립트 편집기 항목 자체가 패널에 안 보이는 경우 (이때는 다시 7a 강제 실행).
+- 흔한 원인: 집중 모드(Do Not Disturb) 활성화, 화면 잠금 중에는 잠금 해제 후 알림 센터에 누적, 스크립트 편집기 항목 자체가 패널에 안 보이는 경우 (이때는 다시 8a 강제 실행).
 
 사용자가 "건너뛰겠다" 고 하면 진행하되, 알림이 안 뜬다는 점을 한 번 더 명시적으로 알린다.
 
-### 8. `launchctl print` 로 검증
+### 9. `launchctl print` 로 검증
 
 ```bash
 for name in com.claude.candy com.claude.candy.progress com.claude.candy.snapshot com.claude.candy.optimizer; do
@@ -234,7 +332,7 @@ done
 
 하나라도 안 맞으면 어떤 agent의 어떤 필드가 문제인지 구체적으로 보고한다.
 
-### 9. 가상 회귀 테스트
+### 10. 가상 회귀 테스트
 
 실제 시간/실제 Claude 호출 없이 격리된 환경에서 전체 로직을 검증한다:
 
@@ -247,7 +345,7 @@ bash tests/virtual_time_test.sh
 
 실패 시 마지막 수십 줄을 사용자에게 보여주고, README의 Troubleshooting 섹션을 같이 제시한다.
 
-### 10. Live smoke — 사용자 선택
+### 11. Live smoke — 사용자 선택
 
 가상 테스트 통과 뒤 사용자에게 명시적으로 묻는다:
 
