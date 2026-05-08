@@ -43,12 +43,12 @@ Claude Code의 5시간 윈도우 시작 시각을 자동으로 앞당기고, 사
 - 정적 소스:
   `bin/`, `tests/`, 기본 `LaunchAgents/*.plist`, `config/lunch_schedule.conf`
 - 런타임 상태:
-  `logs/*`, `config/.optimizer_phase`, `backups/`, 그리고 optimizer가 다시 써 넣는 `LaunchAgents/*.plist`
+  `logs/*`, `config/.optimizer_phase`, `config/.candy_next_ts`, `config/.candy_morning_ts`, `backups/`, 그리고 candy가 매 실행마다 다시 써 넣는 `LaunchAgents/com.claude.candy.{snapshot,progress}.plist`
 
 중요:
 
-- `LaunchAgents/*.plist`는 설치용 예시 파일이면서 동시에 optimizer가 실제로 다시 쓰는 운영 상태입니다.
-- 따라서 repo 안 plist가 “항상 처음 체크인된 기본값”이라고 가정하면 안 됩니다.
+- `LaunchAgents/com.claude.candy.{snapshot,progress}.plist`는 설치용 예시 파일이면서 동시에 candy 실행 시점에 매번 다시 쓰는 운영 상태입니다 (`refresh_claude.sh` 가 직접 갱신). optimizer는 plist에 손대지 않고 `config/.candy_morning_ts` 만 기록합니다.
+- 따라서 repo 안 snapshot/progress plist가 “항상 처음 체크인된 기본값”이라고 가정하면 안 됩니다.
 - `logs/*`와 `.optimizer_phase`도 논리적으로는 generated state입니다. 현재 repo snapshot에 파일이 이미 보이더라도, 그건 과거 실행에서 남은 retained state일 수 있습니다.
 
 ## Runtime Flow
@@ -57,7 +57,7 @@ Claude Code의 5시간 윈도우 시작 시각을 자동으로 앞당기고, 사
 window-start trigger (candy) -> 새 5시간 윈도우 시작 + resetsAt 기록
 progress                     -> 윈도우 1h / 2h / 3h / 4h 누적 사용률 기록
 final snapshot               -> 윈도우 리셋 2분 전 최종 사용률 기록
-optimizer 23:00              -> 전날 데이터 분석 -> 다음 candy/progress/snapshot plist 재생성
+optimizer 23:00              -> 전날 데이터 분석 -> 다음 아침 pre-warm 시각만 .candy_morning_ts 에 기록
 ```
 
 예시:
@@ -220,7 +220,7 @@ optimizer는 평일 23:00에 실행됩니다. 이전과 달리 **단 하나의 �
 
 ### Lunch Rotation and Friday Branch
 
-점심 시간대는 [lunch_schedule.conf](/Users/sms0731/jobs/config/lunch_schedule.conf:1) 에서 관리합니다.
+점심 시간대는 [config/lunch_schedule.conf](config/lunch_schedule.conf) 에서 관리합니다.
 
 ```bash
 CYCLE_ANCHOR="2026-04-13"
@@ -525,7 +525,7 @@ bash tests/live_claude_optimizer_smoke.sh
 
 - `~/.claude/abtop-rate-limits.json`이 아직 없을 수 있음
 - progress/snapshot이 조용히 skip될 수 있음
-- optimizer는 final snapshot 4개가 쌓이기 전까지 skip됨
+- optimizer는 final snapshot 3개가 쌓이기 전까지 skip됨 (`MIN_SNAPSHOTS=3`)
 - 주말이라면 candy/progress/snapshot/optimizer 모두 조기 종료됨
 
 정상적인 초기 흐름:
@@ -535,7 +535,7 @@ bash tests/live_claude_optimizer_smoke.sh
 3. candy 실행
 4. rate-limit 파일이 생김
 5. progress/snapshot 누적
-6. final snapshot 4개 이상 누적 후 optimizer 동작
+6. final snapshot 3개 이상 누적 후 optimizer 동작
 
 ## Troubleshooting
 
@@ -567,7 +567,7 @@ tail -30 ~/jobs/logs/usage_snapshots.csv
 
 대개 정상입니다.
 
-- final snapshot 4개 미만
+- final snapshot 3개 미만
 - 주말
 - Claude 응답 파싱 실패
 - 계산 결과가 현재 스케줄과 동일
@@ -600,7 +600,7 @@ bash tests/live_claude_optimizer_smoke.sh
 
 - `logs/refresh.log`는 최근 100줄만 유지
 - `logs/usage_snapshots.csv`는 최근 500행만 유지
-- final snapshot gate는 기본 4개
+- final snapshot gate는 기본 3개 (`MIN_SNAPSHOTS=3`)
 - 최대 시간 이동폭은 기본 2시간
 - `backups/`는 필요할 때만 생성
 

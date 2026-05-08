@@ -1,0 +1,17 @@
+{
+  "description": "Auto-sync ~/jobs/ from plugin bundle on session start",
+  "hooks": {
+    "SessionStart": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash \"$CLAUDE_PLUGIN_ROOT\"/hooks/sync_jobs.sh",
+            "timeout": 15
+          }
+        ]
+      }
+    ]
+  }
+}

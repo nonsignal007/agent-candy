@@ -20,3 +20,6 @@ plugins/candy/.candy_cwd/
 *.swp
 .omx/
 .omc/
+
+# Skill workspace (superpowers plans, research)
+docs/
