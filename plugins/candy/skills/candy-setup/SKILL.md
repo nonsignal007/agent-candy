@@ -183,20 +183,49 @@ for item in pattern.split(','):
 
 검증: `datetime.date.fromisoformat()` 로 파싱 가능해야 한다.
 
-#### 5d. conf 파일 작성
+#### 5d. 출근 시간 결정 — pre-warm hard constraint
 
-확정된 값으로 conf 파일을 작성한다 (기존 파일 덮어쓰기):
+candy 의 pre-warm 은 **반드시 출근 시간 이전** 에 실행되어야 candy 가 만든 윈도우가 사용자의 첫 활동을 흡수한다 (출근 시각 이후에 pre-warm 이 잡히면 사용자의 자연 윈도우가 이미 시작된 상태라 candy query 가 새 윈도우를 만들지 못하고 토큰만 낭비한다).
+
+따라서 pre-warm 유효 범위 = `(WORK_START - 5h, WORK_START]` 가 되도록 출근 시각을 받아 `WORK_START_HOUR/WORK_START_MIN` 으로 저장한다.
+
+> "Claude Code 를 처음 켜는 시각, 즉 **출근(or 작업 시작) 시각** 을 알려주세요.
+> 이 시각을 기준으로 candy 가 그 이전 시간대에서 pre-warm 시각을 결정합니다.
+>
+> 형식: `HH:MM` (24시간). 기본값: `09:00`."
+
+검증:
+
+```python
+import re
+M = re.match(r'^([01]?\d|2[0-3]):([0-5]\d)$', work_start_input.strip())
+assert M, "형식 오류 — HH:MM 으로 입력해주세요"
+WORK_START_HOUR = int(M.group(1))
+WORK_START_MIN  = int(M.group(2))
+```
+
+기존 conf 가 있고 1단계에서 "그대로 둠" 을 선택했고 `WORK_START_HOUR` 키가 이미 있다면 5d 도 스킵 가능. 키가 없으면 (구버전 conf) 반드시 묻는다.
+
+#### 5e. conf 파일 작성
+
+확정된 lunch + work_start 값으로 conf 파일을 작성한다 (기존 파일 덮어쓰기):
 
 ```bash
 cat > "$JOBS_ROOT/config/lunch_schedule.conf" <<EOF
-# Claude Candy 점심 시간 로테이션 설정
-# 매주 업데이트 or N주 순환 자동 계산
-#
-# CYCLE_ANCHOR: 이 날짜가 속한 주의 점심 = CYCLE_PATTERN 첫 번째 값
-# CYCLE_PATTERN: 쉼표 구분, N주 순환 (HH:MM-HH:MM)
+# Claude Candy 사용자 스케줄 설정
+# candy-setup 시 사용자 입력으로 채워진다.
+# sync 시에도 보존된다 (사용자 파일이 있으면 번들이 덮어쓰지 않음).
 
+# ─── 점심 시간 (5h 윈도우 안으로 흡수) ───
+# CYCLE_ANCHOR: 이 날짜가 속한 주의 점심 = CYCLE_PATTERN 첫 번째 값
+# CYCLE_PATTERN: 쉼표 구분, 1~N 항목, N주 단위 순환 (HH:MM-HH:MM)
 CYCLE_ANCHOR="$ANCHOR"
 CYCLE_PATTERN="$PATTERN"
+
+# ─── 출근 시간 (pre-warm hard constraint) ───
+# pre-warm 유효 범위: (WORK_START - 5h, WORK_START]
+WORK_START_HOUR=$WORK_START_HOUR
+WORK_START_MIN=$WORK_START_MIN
 EOF
 ```
 
@@ -204,12 +233,13 @@ EOF
 
 > "다음 내용으로 `$JOBS_ROOT/config/lunch_schedule.conf` 를 작성했습니다.
 >
-> - ANCHOR: `<ANCHOR>` (이 주에 첫 번째 패턴 적용)
-> - PATTERN: `<PATTERN>`
+> - 점심 ANCHOR: `<ANCHOR>` (이 주에 첫 번째 패턴 적용)
+> - 점심 PATTERN: `<PATTERN>`
+> - 출근 시각: `<WORK_START_HOUR>:<WORK_START_MIN>` (pre-warm 은 이 시각 이전으로만 잡힘)
 >
 > 이대로 진행할까요?"
 
-"틀렸다" 고 하면 5b 부터 다시 받는다.
+"틀렸다" 고 하면 어느 항목인지 물어 5b (점심) 또는 5d (출근) 부터 다시 받는다.
 
 ### 6. LaunchAgent symlinks 생성
 

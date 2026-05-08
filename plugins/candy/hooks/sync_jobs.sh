@@ -72,9 +72,13 @@ for dir in bin LaunchAgents tests; do
     fi
 done
 
-# config: lunch_schedule.conf 만 교체, 런타임 파일은 건드리지 않음
+# config: 사용자 입력값 (lunch / work_start) 가 들어있는 lunch_schedule.conf 는 보존.
+# 사용자 파일이 없을 때만 (=신규 설치) 번들 기본값을 깐다.
 mkdir -p "$JOBS_ROOT/config"
-[ -f "$PLUGIN_ROOT/config/lunch_schedule.conf" ] && cp "$PLUGIN_ROOT/config/lunch_schedule.conf" "$JOBS_ROOT/config/" 2>>"$LOG"
+if [ -f "$PLUGIN_ROOT/config/lunch_schedule.conf" ] && [ ! -f "$JOBS_ROOT/config/lunch_schedule.conf" ]; then
+    cp "$PLUGIN_ROOT/config/lunch_schedule.conf" "$JOBS_ROOT/config/" 2>>"$LOG"
+    log "lunch_schedule.conf 신규 배포 (사용자 파일 없음)"
+fi
 
 # README
 [ -f "$PLUGIN_ROOT/README.md" ] && cp "$PLUGIN_ROOT/README.md" "$JOBS_ROOT/" 2>>"$LOG"

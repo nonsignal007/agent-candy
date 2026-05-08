@@ -1,93 +1,240 @@
 # agent-candy
 
-Claude Code 플러그인 마켓플레이스. `candy` 플러그인 하나를 제공한다.
+[![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](https://opensource.org/licenses/MIT)
+[![Platform: macOS](https://img.shields.io/badge/Platform-macOS-blue.svg)](https://www.apple.com/macos/)
+[![Plugin: candy](https://img.shields.io/badge/Plugin-candy-pink.svg)](plugins/candy/README.md)
 
-## candy — 5시간 윈도우 자동화
+Claude Code 세션 초기화 시점을 자동으로 재배치해서,
+토큰 사용량 피크가 하나의 5시간 윈도우에 몰리지 않게 분산시키는 플러그인.
 
-점심시간을 Claude Code 의 5시간 사용 윈도우 안에 포함시켜 토큰 낭비를 줄이고, 오후 고사용 시간대에 새 윈도우가 시작되도록 자동 조정하는 macOS LaunchAgent 번들이다.
+[왜 필요한가?](#왜-필요한가) • [핵심 아이디어](#candy의-핵심-아이디어) • [빠른 시작](#빠른-시작) • [내부 동작](plugins/candy/README.md) • [개발 워크플로](#개발-워크플로-기여자용)
 
-자세한 내부 동작은 [plugins/candy/README.md](plugins/candy/README.md) 를 참고.
+---
 
-## 설치
+## 빠른 시작
 
-### 1. 이 마켓플레이스 등록
-
-Claude Code 에서:
+### Step 1: 마켓플레이스 등록
 
 ```
 /plugin marketplace add nonsignal007/agent-candy
 ```
 
-### 2. 플러그인 설치
+### Step 2: 플러그인 설치
 
 ```
 /plugin install candy@agent-candy
 ```
 
-### 3. 설치 스킬 실행
+### Step 3: 설치 스킬 실행
 
-플러그인이 설치되면 `candy-setup` 스킬이 자동 등록된다. 설치하려면 다음과 같이 요청한다:
+Claude Code 에 다음처럼 요청:
 
 - "claude candy 설치해줘"
 - "candy 스케줄러 설정"
-- "점심시간 pre-warm 설정"
+- "candy 최적화 설정"
 
-스킬이 다음을 자동으로 수행한다:
+`candy-setup` 스킬이 자동으로:
 
-1. JOBS_ROOT 경로 확인 (기본 `~/jobs`)
+1. JOBS_ROOT 확인 (기본 `~/jobs`)
 2. 의존성 검증 (`claude`, `python3`, `launchctl`, `plutil`, `osascript`)
 3. Claude CLI preflight
-4. 플러그인 번들을 JOBS_ROOT 로 복사
-5. `~/Library/LaunchAgents` symlink 생성
-6. LaunchAgent 부트스트랩
-7. **macOS 알림 권한 확인 (사용자 수동 단계)**
-8. `launchctl print` 로 검증
-9. 가상 회귀 테스트 실행
-10. (옵션) Live smoke 테스트
+4. 번들 배포 + `~/Library/LaunchAgents` symlink
+5. LaunchAgent bootstrap
+6. macOS 알림 권한 확인 (사용자 수동 단계)
+7. `launchctl print` 검증
+8. 가상 회귀 테스트
+9. (옵션) Live smoke test
+
+를 수행한다.
+
+---
 
 ## 자동 업데이트
 
-설치 후엔 사용자가 별도로 무엇을 할 필요가 없다. 마켓플레이스가 새 버전을 올리면 다음 Claude Code 세션 시작 시 `hooks/sync_jobs.sh` 가 자동으로:
+설치 후에는 별도 관리가 필요 없다. 새 버전이 배포되면:
 
-1. `plugin.json` 의 새 version 과 사용자의 `~/jobs/.candy_version` 비교
-2. 다르면 `bin/`, `LaunchAgents/`, `tests/` 와 `lunch_schedule.conf` 새 번들로 갱신
-3. LaunchAgent 4개 재부트스트랩
-4. 버전 파일 갱신 + 알림 표시
+- SessionStart hook 이 version 을 비교하고
+- 필요한 파일만 자동 sync 하며
+- LaunchAgent 를 재부트스트랩한다
 
-`logs/`, `config/.optimizer_phase` 등 런타임 상태는 보존된다. 자동 sync 를 끄고 싶으면 `~/.candy_no_sync` 빈 파일을 만든다.
+런타임 상태는 유지된다:
+
+- `logs/`
+- optimizer state
+- next reset timestamp
+- usage snapshots
+
+자동 sync 를 끄고 싶다면:
+
+```bash
+touch ~/.candy_no_sync
+```
+
+---
+
+## 왜 필요한가?
+
+Claude 는 5시간 단위 세션 제한을 사용한다.
+
+문제는 실제 업무 패턴은 균등하지 않다는 점이다.
+
+대부분의 사용자는 특정 시간대에 집중적으로 작업하고,
+그 몇 시간 동안 토큰 사용량이 폭발적으로 증가한다.
+
+예를 들어:
+
+| 시간 | 상태 |
+|---|---|
+| 09:00 | 출근 + 세션 시작 |
+| 09:00~11:00 | 집중 작업 |
+| 11:00 | 대부분의 토큰 소진 |
+| 11:00~14:00 | 사실상 작업 불가 |
+| 14:00 | 세션 초기화 |
+
+문제는:
+
+> 토큰 사용량 피크가 하나의 5시간 윈도우 안에 압축된다는 것.
+
+즉 실제로 가장 중요한 시간대에
+세션이 exhausted 상태가 되어버린다.
+
+---
+
+## candy의 핵심 아이디어
+
+candy 는 사용 패턴을 분석해서:
+
+- 토큰 사용량이 폭주하는 시간대를 찾고
+- 세션 초기화 시점을 그 피크 한가운데로 이동시킨다
+
+예를 들어 사용자가 매일 09:00~11:00 사이에 토큰을 많이 사용한다면:
+
+| 시간 | 세션 상태 |
+|---|---|
+| 05:00 | 짧은 pre-warm 세션 소비 |
+| 09:00~10:00 | 이전 윈도우 사용 |
+| 10:00 | 세션 초기화 |
+| 10:00~11:00 | 새로운 윈도우 사용 |
+
+결과적으로:
+
+- 원래 하나의 윈도우에 몰리던 사용량이
+- 두 개의 세션 윈도우로 분산된다
+
+즉:
+
+- 09~10시는 이전 윈도우
+- 10~11시는 다음 윈도우
+
+를 사용하게 된다.
+
+candy 의 목적은:
+
+> 토큰 폭주 시간을 세션 경계로 분리해서,
+> 특정 시간대에 토큰이 한 번에 고갈되는 현상을 줄이는 것.
+
+---
+
+## candy가 하는 일
+
+### 1. 사용량 패턴 분석
+
+`usage_snapshots.csv` 를 기반으로:
+
+- 언제 토큰 사용량이 집중되는지
+- 어떤 시간대에 exhaustion 이 발생하는지
+- 세션 경계가 비효율적으로 배치되어 있는지
+
+를 추적한다.
+
+### 2. 세션 경계 재배치
+
+candy 는:
+
+- pre-warm 세션을 일부러 미리 소비하거나
+- 점심/비활성 시간을 윈도우 안으로 흡수해서
+
+다음 세션 초기화 시점을 이동시킨다.
+
+핵심 목표는:
+
+> "사용량 피크"와 "세션 경계"를 겹치게 만드는 것.
+
+### 3. 자동 최적화
+
+사용자는 시간을 계산할 필요가 없다.
+
+candy 가 자동으로:
+
+- 다음 세션 시작 시점
+- pre-warm 타이밍
+- optimizer phase
+- reset alignment
+
+를 조정한다.
+
+---
+
+## 특징
+
+- 사용량 기반 세션 재배치
+- 토큰 피크 분산
+- 세션 exhaustion 감소
+- 점심/비활성 시간 흡수
+- 자동 pre-warm
+- LaunchAgent 기반 자동 실행
+- SessionStart 자동 sync
+- 런타임 상태 보존
+- 셀프 진단 (`candy-doctor`)
+
+---
+
+
+## 구성 요소
+
+| 컴포넌트 | 역할 |
+|---|---|
+| `candy-setup` | 설치 / 재배포 |
+| `candy-doctor` | 헬스체크 / 자동 수정 |
+| `sync_jobs.sh` | SessionStart 자동 버전 sync |
+| LaunchAgent 4개 | snapshot / progress / optimizer / chain-gate |
+| `usage_snapshots.csv` | 사용 패턴 분석 데이터 |
+
+---
 
 ## 요구 사항
 
 - macOS (GUI 로그인 세션)
-- `claude` CLI (로그인된 상태)
+- Claude CLI (로그인된 상태)
 - `python3`, `launchctl`, `plutil`, `osascript`
+
+---
 
 ## 저장소 구조
 
-```
+```text
 agent-candy/
 ├── .claude-plugin/
-│   └── marketplace.json          # 마켓플레이스 매니페스트
+│   └── marketplace.json
 └── plugins/
     └── candy/
         ├── .claude-plugin/
-        │   └── plugin.json       # 플러그인 매니페스트
+        │   └── plugin.json
         ├── skills/
         │   ├── candy-setup/
-        │   │   └── SKILL.md      # 설치 스킬
         │   └── candy-doctor/
-        │       ├── SKILL.md      # 헬스체크/진단 스킬
-        │       └── scripts/      # candy_doctor.py 진단 스크립트
-        ├── hooks/                 # SessionStart 자동 sync 훅
+        ├── hooks/
         │   ├── hooks.json
         │   └── sync_jobs.sh
-        ├── bin/                   # Candy 실행 스크립트
-        ├── LaunchAgents/          # plist 템플릿 4개
+        ├── bin/
+        ├── LaunchAgents/
         ├── config/
         │   └── lunch_schedule.conf
-        ├── tests/                 # 가상/실제 테스트
-        └── README.md              # Candy 상세 문서
+        ├── tests/
+        └── README.md
 ```
+
+---
 
 ## 개발 워크플로 (기여자용)
 
@@ -113,11 +260,15 @@ agent-candy/
 **왜 필수인가:** `hooks/sync_jobs.sh` 가 SessionStart 마다 `plugin.json` 의 version 과 사용자의 `~/jobs/.candy_version` 을 비교한다. 다르면 자동으로 사용자의 `~/jobs/` 를 새 번들로 동기화하고 LaunchAgent 를 재부트스트랩한다. **version 을 안 올리면 사용자는 옛 코드를 영원히 돌리게 된다.**
 
 **semver 가이드:**
-- **patch** (0.2.0 → 0.2.1): 버그 픽스, 사용자 동작 무변화
-- **minor** (0.2.0 → 0.3.0): 새 기능, plist 구조 변경, 새 스크립트 추가
-- **major** (0.2.0 → 1.0.0): config 포맷 변경, 런타임 상태 schema 변경 등 backward-incompatible
+
+| Bump | 예시 | 기준 |
+|------|------|------|
+| **patch** | 0.2.0 → 0.2.1 | 버그 픽스, 사용자 동작 무변화 |
+| **minor** | 0.2.0 → 0.3.0 | 새 기능, plist 구조 변경, 새 스크립트 추가 |
+| **major** | 0.2.0 → 1.0.0 | config 포맷 변경, 런타임 상태 schema 변경 등 backward-incompatible |
 
 다음은 version bump 를 **건너뛰어도 된다**:
+
 - `skills/`, `hooks/` 만 바뀐 경우 (Claude Code 가 cache 에서 직접 실행)
 - `.gitignore`, `README.md`, `LICENSE` 만 바뀐 경우
 
@@ -130,6 +281,7 @@ agent-candy/
 - `plugins/candy/.candy_cwd/`, `plugins/candy/backups/`
 
 가장 자주 실수하는 두 파일:
+
 - `plugins/candy/LaunchAgents/com.claude.candy.snapshot.plist`
 - `plugins/candy/LaunchAgents/com.claude.candy.progress.plist`
 
@@ -147,13 +299,17 @@ bash plugins/candy/tests/virtual_time_test.sh
 
 ### Doctor / Setup / Hook 의 역할 분담
 
-- `candy-doctor` — 헬스체크 + 실행 검증. `runtime.version_sync` 체크로 사용자의 `~/jobs/.candy_version` 이 plugin.json 과 다르면 warn.
-- `candy-setup` — 첫 설치 / 강제 재배포 용. 자동 sync 도입 후로는 사용자가 다시 돌릴 일이 거의 없다.
-- `hooks/sync_jobs.sh` — SessionStart 마다 자동 sync.
+| 도구 | 언제 |
+|------|------|
+| `candy-doctor` | 헬스체크 + 실행 검증. `runtime.version_sync` 체크로 사용자의 `~/jobs/.candy_version` 이 plugin.json 과 다르면 warn |
+| `candy-setup` | 첫 설치 / 강제 재배포 용. 자동 sync 도입 후로는 사용자가 다시 돌릴 일이 거의 없다 |
+| `hooks/sync_jobs.sh` | SessionStart 마다 자동 sync |
 
 ### 커밋 메시지
 
 영어로 작성, 본문은 "왜" 중심. version bump 가 포함된 커밋은 메시지 첫 줄에 `(v0.X.Y)` 또는 본문에 `Bump version to 0.X.Y` 한 줄을 명시.
+
+---
 
 ## 라이선스
 

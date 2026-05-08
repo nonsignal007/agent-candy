@@ -292,9 +292,39 @@ ${hist}
 "
     fi
 
+    # 동적 출근 시간 라벨
+    local ws_label
+    ws_label=$(printf '%02d:%02d' "$WORK_START_HOUR" "$WORK_START_MIN")
+    local pw_window
+    pw_window=$(prewarm_window_label)
+    # reset_1/2/3 범위 계산
+    local ws_min=$((WORK_START_HOUR * 60 + WORK_START_MIN))
+    local r1_lo=$((ws_min + PREWARM_MIN_BUFFER_MIN))
+    local r1_hi=$((ws_min + 300))
+    local r2_lo=$((r1_lo + 300))
+    local r2_hi=$((r1_hi + 300))
+    local r3_lo=$((r2_lo + 300))
+    local r3_hi=$((r2_hi + 300))
+    local r1_range r2_range r3_range
+    r1_range=$(printf '(%02d:%02d, %02d:%02d]' $((r1_lo/60)) $((r1_lo%60)) $((r1_hi/60)) $((r1_hi%60)))
+    r2_range=$(printf '(%02d:%02d, %02d:%02d]' $((r2_lo/60)) $((r2_lo%60)) $((r2_hi/60)) $((r2_hi%60)))
+    r3_range=$(printf '(%02d:%02d, %02d:%02d]' $((r3_lo/60)) $((r3_lo%60)) $((r3_hi/60)) $((r3_hi%60)))
+
     local prompt
     prompt=$(cat << PROMPT_EOF
 너는 Claude Code 5시간 윈도우 스케줄 최적화 전문가야.
+
+## candy 의 핵심 전략 (이걸 먼저 이해해)
+candy 의 목적은 **토큰 사용량 피크를 단일 5시간 윈도우에 가두지 않고, 세션 경계(=다음 reset 시점) 를 피크 한가운데로 옮겨서 같은 피크가 두 개의 윈도우에 걸쳐 분산되게 만드는 것**이다.
+
+예: 사용자가 매일 09~11시에 토큰을 폭주시키는 패턴이라면
+- pre-warm 을 05:00 에 두면 → 다음 reset 이 10:00
+- 09~10시 사용량은 이전 윈도우가, 10~11시 사용량은 새 윈도우가 흡수
+- 결과: 원래 한 윈도우에 몰리던 피크가 두 윈도우로 쪼개져서 사실상 가용 토큰이 2배
+
+"피크를 fresh window 에 정렬" 이 아니라 **"피크 한복판에 윈도우 경계를 꽂는다"** 가 핵심이다.
+
+부수적으로, 점심/비활성 시간이 윈도우 내부에 흡수되면 실질 토큰 밀도가 올라가는 secondary optimization 이 있다. 이 둘이 충돌하지 않을 때 함께 만족시킨다.
 
 ## 시스템 동작 원리
 - Claude Code는 5시간 고정 윈도우로 토큰 한도를 관리함
@@ -307,38 +337,63 @@ ${hist}
 ## 데이터 읽는 법
 - "윈도우 07:24-12:23: 최종 91%" = 그 윈도우가 만료 직전에 91% 소진됨
 - "흐름: 1h=18%, 2h=47%, 3h=68%, 4h=100%(limit carry)" = 같은 윈도우의 누적 진행률
-- 높은 최종 % = 해당 윈도우의 토큰이 부족했을 가능성
-- limit carry가 붙으면 그 시점 이후는 사실상 이미 한도 소진 상태
+- 높은 최종 % = 해당 윈도우 시간대에 토큰 폭주 = **분산 후보**
+- limit carry가 붙으면 그 시점 이후는 사실상 이미 한도 소진 상태 → 그 시점 직전이 피크 한복판
+- 흐름 곡선의 기울기가 가장 가파른 구간이 실제 폭주 시간대
 
 ## 사용자 프로필
-- 매일 09:00 출근, Claude Code 세션 시작
-- 오전보다 오후에 사용량이 많음
+- 매일 ${ws_label} 출근, Claude Code 세션 시작
 - 점심시간에는 전혀 사용하지 않음
+- 사용량 피크는 데이터로 판단 (오후 쪽이 무거운 경향)
+
+## 🚨 출근 시간 제약 (반드시 지켜야 함, 최우선 hard constraint)
+사용자는 ${ws_label} 에 출근해서 Claude Code 를 쓰기 시작한다.
+
+**pre-warm 은 반드시 ${ws_label} 이전에 실행되어야** candy 가 만든 윈도우가 사용자의 첫 활동을 흡수한다. 그렇지 않으면:
+- pre-warm 이 ${ws_label} 이후이면 → 사용자가 ${ws_label} 에 자연 시작한 윈도우가 이미 active 라서 candy 의 query 는 새 윈도우를 만들지 못하고 기존 윈도우 안의 토큰만 낭비
+- pre-warm 이 너무 이르면 → 그 윈도우가 ${ws_label} 이전에 만료되어 사용자 활동을 흡수 못함
+
+따라서 **pre-warm ∈ ${pw_window} 범위 안에서만 선택**해야 한다. 이 범위를 벗어나는 답은 무효다.
+
+## 체인 reset 으로 사고하라 (피크 분산의 핵심)
+pre-warm 한 번이면 그날 하루 동안의 reset 시각이 모두 결정된다:
+- reset_1 = pre-warm + 5h  ∈ ${r1_range}   ← 오전~점심 사이
+- reset_2 = pre-warm + 10h ∈ ${r2_range}   ← **오후 피크 분산은 보통 이 reset 으로**
+- reset_3 = pre-warm + 15h ∈ ${r3_range}   ← 저녁
+
+피크를 분산하고 싶다면 reset_1, reset_2, reset_3 중 하나가 **피크 한가운데** 에 떨어지도록 pre-warm 을 역산해서 선택한다.
+
+예시 (출근 09:00 기준 일반론):
+- 오후 피크 17:00~19:00 (한가운데 18:00) 분산 목표 → reset_2 = 18:00 → pre-warm = 08:00
+- 오전 피크 09:00~11:00 (한가운데 10:00) 분산 목표 → reset_1 = 10:00 → pre-warm = 05:00
+- 점심 직후 13:00 분산 목표 → reset_1 = 13:00 → pre-warm = 08:00 (점심 흡수도 동시 만족)
 
 ## ${lunch_label}
 ${lunch}
 
 ## 현재 아침 pre-warm 시각
 ${current_morning}
-(이 시각에 candy가 실행되어 5시간 윈도우가 시작됨)
+(이 시각에 candy가 실행되어 5시간 윈도우가 시작됨 → 그 후 reset_1, reset_2, reset_3 가 5h 간격으로 자동 체인)
 
 ## 윈도우별 사용률 데이터
 ${usage_summary}
 
 ${hist_section}## 최적화 원칙
-1. 토큰 효율: 점심(비사용 시간)이 윈도우 안에 포함되면 실질 사용 가능 시간당 토큰 밀도 상승
-2. 오후 보호: 점심 끝 무렵에 새 윈도우가 시작되어 오후에 풀 토큰 확보
-3. pre-warm 공식: pre-warm = 점심 끝 시각 - 5시간 (분 단위 정확)
-   - 예: 점심 13:00 종료 → pre-warm 08:00 (정확히!)
-   - 예: 점심 12:45 종료 → pre-warm 07:45
-4. 데이터 기반: 윈도우 사용률이 80% 이상이면 해당 시간대에 토큰이 부족했다는 신호
-5. 분 단위로 HH:MM 자유롭게 최적화 가능 (더 이상 MM=01 고정 아님)
+0. **출근 시간 hard constraint (위에서 설명한 그대로):** pre-warm ∈ ${pw_window}. 이 범위 밖은 무효.
+1. **피크 분산 (최우선):** 윈도우 사용률 데이터에서 토큰이 가장 집중된 시간대(또는 limit carry 가 발생한 시점) 를 찾고, **reset_1/reset_2/reset_3 중 하나가 그 피크 한가운데로** 떨어지게 pre-warm 을 역산한다.
+2. **점심 흡수 (보조):** 위 0/1 이 만족되는 선에서, 점심시간이 reset_1 직전 또는 윈도우 내부에 들어오면 가산점. 점심 직후가 피크라면 1번과 자연스럽게 일치한다.
+3. **데이터 신호:** 윈도우 사용률 80% 이상 = 해당 시간대 토큰 부족 = 그 시간대를 두 윈도우로 쪼개야 할 후보. limit carry 가 붙은 시점은 더 강한 신호.
+4. **공식:**
+   - reset_N = pre-warm + N×5시간
+   - pre-warm = (목표 reset 시각) - N×5시간 (분 단위 정확)
+   - 결과 pre-warm 이 ${pw_window} 안에 있어야 채택 가능. 안 들어오면 다른 N 으로 다시 시도.
+5. 분 단위로 HH:MM 자유롭게 최적화 가능.
 
 ## 출력 형식
 반드시 아래 JSON 객체만 출력하고 다른 텍스트는 일절 쓰지 마라.
-{"time": [HH, MM], "reason": "한국어 2-3줄"}
+{"time": [HH, MM], "reason": "한국어 2-3줄. 어떤 시간대를 피크로 식별했고, 어떤 reset_N 을 그 피크 한가운데에 꽂았는지, 결과 pre-warm 이 ${pw_window} 안에 있는지 명시."}
 
-time: 정확히 1개, HH=0-23 정수, MM=0-59 정수. 아침 pre-warm 시각.
+time: 정확히 1개, HH=0-23 정수, MM=0-59 정수. 아침 pre-warm 시각. **반드시 ${pw_window} 범위 안의 값.**
 PROMPT_EOF
 )
 
@@ -450,7 +505,34 @@ PYEOF
     done
 }
 
-# Claude 응답 검증 + 변경폭 클리핑 (1개 시각)
+# Hard constraint: pre-warm ∈ (WORK_START - 5h, WORK_START]
+# WORK_START 는 lunch_schedule.conf 에서 읽음 (사용자가 candy-setup 에서 지정)
+load_work_start() {
+    local conf="$LUNCH_CONF"
+    WORK_START_HOUR=9
+    WORK_START_MIN=0
+    [ -f "$conf" ] || return 0
+    # grep no-match 를 set -e/pipefail 트랩에 걸리지 않도록 || true 로 흡수.
+    # 구버전 conf (WORK_START 키 없음) 를 가진 업그레이드 사용자도 안전하게 fallback.
+    local h m
+    h=$(grep -E '^WORK_START_HOUR=' "$conf" 2>/dev/null | sed 's/^WORK_START_HOUR=//;s/"//g' | tr -d ' ' || true)
+    m=$(grep -E '^WORK_START_MIN=' "$conf" 2>/dev/null  | sed 's/^WORK_START_MIN=//;s/"//g'  | tr -d ' ' || true)
+    [ -n "$h" ] && WORK_START_HOUR="$h"
+    [ -n "$m" ] && WORK_START_MIN="$m"
+}
+load_work_start
+PREWARM_MIN_BUFFER_MIN=${PREWARM_MIN_BUFFER_MIN:-30}  # pre-warm + 5h 가 work_start 보다 최소 N분 이후
+
+# pre-warm 유효 범위 라벨 (prompt + 로그용)
+prewarm_window_label() {
+    local ws_min=$((WORK_START_HOUR * 60 + WORK_START_MIN))
+    local lower=$((ws_min + PREWARM_MIN_BUFFER_MIN - 300))
+    if [ $lower -lt 0 ]; then lower=0; fi
+    printf '(%02d:%02d, %02d:%02d]' \
+        $((lower / 60)) $((lower % 60)) \
+        $((ws_min / 60)) $((ws_min % 60))
+}
+
 validate_and_clip() {
     local claude_json="$1"
     local old_morning_ts="$2"
@@ -458,6 +540,7 @@ validate_and_clip() {
     export CLAUDE_JSON="$claude_json"
     export OLD_MORNING_TS="$old_morning_ts"
     export MAX_SHIFT_MIN
+    export WORK_START_HOUR WORK_START_MIN PREWARM_MIN_BUFFER_MIN
 
     python3 << 'PYEOF'
 import json, os, sys, datetime
@@ -475,6 +558,29 @@ if not (0 <= nh <= 23 and 0 <= nm <= 59):
     print(f"ERROR:허용 범위 외 시각 {nh}:{nm}", file=sys.stderr)
     sys.exit(1)
 
+# 출근 시간 hard constraint
+ws_h = int(os.environ["WORK_START_HOUR"])
+ws_m = int(os.environ["WORK_START_MIN"])
+buf  = int(os.environ["PREWARM_MIN_BUFFER_MIN"])
+work_start_min = ws_h * 60 + ws_m
+# pre-warm + 5h > work_start + buf  ⇔  pre-warm > work_start + buf - 300
+prewarm_lower = (work_start_min + buf) - 300  # exclusive lower (must be > this)
+prewarm_upper = work_start_min                  # inclusive upper
+
+new_min = nh * 60 + nm
+clipped_by_window = False
+if new_min <= prewarm_lower:
+    new_min = prewarm_lower + 1
+    clipped_by_window = True
+elif new_min > prewarm_upper:
+    new_min = prewarm_upper
+    clipped_by_window = True
+
+if clipped_by_window:
+    nh = new_min // 60
+    nm = new_min % 60
+    print(f"WARN:출근 제약 클리핑 → {nh:02d}:{nm:02d}", file=sys.stderr)
+
 old_ts = int(os.environ.get("OLD_MORNING_TS", "0") or "0")
 max_allowed = int(os.environ["MAX_SHIFT_MIN"])
 shift = 0
@@ -482,15 +588,18 @@ shift = 0
 if old_ts > 0:
     old_dt = datetime.datetime.fromtimestamp(old_ts)
     old_min = old_dt.hour * 60 + old_dt.minute
-    new_min = nh * 60 + nm
     diff = new_min - old_min
     shift = abs(diff)
     if shift > max_allowed:
         new_min = old_min + (max_allowed if diff > 0 else -max_allowed)
-        new_min = new_min % 1440
+        # 변경폭 클리핑 후에도 출근 제약 재적용
+        if new_min <= prewarm_lower:
+            new_min = prewarm_lower + 1
+        elif new_min > prewarm_upper:
+            new_min = prewarm_upper
         nh = new_min // 60
         nm = new_min % 60
-        shift = max_allowed
+        shift = abs(new_min - old_min)
 
 print(f"{nh} {nm}")
 print(reason)
