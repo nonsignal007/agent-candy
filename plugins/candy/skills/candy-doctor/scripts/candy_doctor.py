@@ -708,15 +708,57 @@ class ConfigChecker:
                 c.message = f"{p.name} unreadable: {e}"
             return c
 
+        def _morning_ts_check() -> Check:
+            c = Check(id="state.candy_morning_ts", category="config", severity="warn")
+            p = cfg / ".candy_morning_ts"
+            if not p.exists():
+                c.severity = "detail"
+                c.status = "pass"
+                c.message = ".candy_morning_ts absent (chain mode without morning gate)"
+                return c
+            try:
+                ts = int(p.read_text().strip())
+                c.details["ts"] = ts
+                ahead_sec = ts - now
+                ahead_days = ahead_sec / 86400
+                if ts <= now:
+                    c.severity = "detail"
+                    c.status = "pass"
+                    c.message = f".candy_morning_ts: 과거 시각 (사용됐거나 stale, age {(now - ts) // 60}min)"
+                elif ahead_days > 2:
+                    # optimizer DOW 버그 등으로 너무 먼 미래로 설정된 경우
+                    c.status = "warn"
+                    c.message = (
+                        f".candy_morning_ts: {ahead_days:.1f}일 후 — optimizer DOW 버그 의심. "
+                        f"candy가 그때까지 실행되지 않음 ({ts})"
+                    )
+                    import datetime as _dt
+                    ts_dt = _dt.datetime.fromtimestamp(ts)
+                    h_val, m_val = ts_dt.hour, ts_dt.minute
+                    c.fix_policy = "confirm"
+                    c.fix_command = (
+                        f"python3 -c \""
+                        f"import datetime; "
+                        f"today=datetime.date.today(); "
+                        f"wd=today.isoweekday(); "
+                        f"d=8-wd if wd>=5 else 1; "
+                        f"nd=today+datetime.timedelta(days=d); "
+                        f"dt=datetime.datetime.combine(nd, datetime.time({h_val}, {m_val})); "
+                        f"print(int(dt.timestamp()))"
+                        f"\" | tee {p}"
+                    )
+                else:
+                    c.severity = "detail"
+                    c.status = "pass"
+                    c.message = f".candy_morning_ts: 다음 아침까지 {ahead_sec // 60}분 남음"
+            except Exception as e:
+                c.status = "warn"
+                c.message = f".candy_morning_ts unreadable: {e}"
+            return c
+
         cfg = self.ctx.jobs_root / "config"
         return [
-            _ts_check(
-                "state.candy_morning_ts",
-                cfg / ".candy_morning_ts",
-                ".candy_morning_ts absent (chain mode without morning gate)",
-                ".candy_morning_ts: 다음 아침까지 {mins}분 남음",
-                ".candy_morning_ts: 과거 시각 (사용됐거나 stale, age {mins}min)",
-            ),
+            _morning_ts_check(),
             _ts_check(
                 "state.candy_next_ts",
                 cfg / ".candy_next_ts",

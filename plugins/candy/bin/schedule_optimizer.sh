@@ -490,10 +490,10 @@ PYEOF
             return 1
         fi
 
-        # claude -p 호출 + per-call timeout
-        claude -p --model haiku --output-format json "$prompt" > "$tmp_out" 2>&1 &
+        # claude -p 호출 + per-call timeout (process group kill로 하위 프로세스까지 정리)
+        ( set -m; claude -p --model haiku --output-format json "$prompt" > "$tmp_out" 2>&1 ) &
         claude_pid=$!
-        ( sleep "$CLAUDE_CALL_TIMEOUT" && kill -TERM "$claude_pid" 2>/dev/null ) &
+        ( sleep "$CLAUDE_CALL_TIMEOUT" && kill -- -"$claude_pid" 2>/dev/null ) &
         killer_pid=$!
         wait "$claude_pid" 2>/dev/null || true
         kill "$killer_pid" 2>/dev/null || true
@@ -634,8 +634,10 @@ PYEOF
 # 날짜를 넘어갈 수 있으므로, 호출 시점의 today.isoweekday()로 다음 평일을 계산.
 compute_morning_ts() {
     local h="$1" m="$2"
-    H="$h" M="$m" python3 << 'PYEOF'
-import datetime, os, time
+    local _warn_file
+    _warn_file=$(mktemp)
+    H="$h" M="$m" python3 << 'PYEOF' 2>"$_warn_file"
+import datetime, os, sys, time
 from candy_time import get_today
 
 today = get_today()
@@ -656,7 +658,6 @@ result_ts = int(dt.timestamp())
 # 안전장치: 4일 초과면 경고 후 내일로 클램프
 now_ts = int(time.time())
 if result_ts - now_ts > 4 * 86400:
-    import sys
     print(f"WARN: morning_ts가 {(result_ts - now_ts)//86400}일 후로 설정됨 — 내일로 클램프", file=sys.stderr)
     fallback = today + datetime.timedelta(days=1)
     dt = datetime.datetime.combine(fallback, datetime.time(h, m))
@@ -664,6 +665,11 @@ if result_ts - now_ts > 4 * 86400:
 
 print(result_ts)
 PYEOF
+    # 경고가 있으면 schedule_changes.log 에도 기록
+    if [ -s "$_warn_file" ]; then
+        log_change "$(cat "$_warn_file")"
+    fi
+    rm -f "$_warn_file"
 }
 
 main() {
