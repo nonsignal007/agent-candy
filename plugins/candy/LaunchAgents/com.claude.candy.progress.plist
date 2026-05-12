@@ -14,27 +14,27 @@
 	<array>
 		<dict>
 			<key>Hour</key>
-			<integer>13</integer>
+			<integer>7</integer>
 			<key>Minute</key>
-			<integer>34</integer>
+			<integer>29</integer>
 		</dict>
 		<dict>
 			<key>Hour</key>
-			<integer>14</integer>
+			<integer>8</integer>
 			<key>Minute</key>
-			<integer>34</integer>
+			<integer>29</integer>
 		</dict>
 		<dict>
 			<key>Hour</key>
-			<integer>15</integer>
+			<integer>9</integer>
 			<key>Minute</key>
-			<integer>34</integer>
+			<integer>29</integer>
 		</dict>
 		<dict>
 			<key>Hour</key>
-			<integer>16</integer>
+			<integer>10</integer>
 			<key>Minute</key>
-			<integer>34</integer>
+			<integer>29</integer>
 		</dict>
 	</array>
 </dict>

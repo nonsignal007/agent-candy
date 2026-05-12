@@ -19,6 +19,9 @@ CANDY_MORNING_TS_FILE="${CANDY_MORNING_TS_FILE:-$JOBS_ROOT/config/.candy_morning
 
 MIN_SNAPSHOTS=${MIN_SNAPSHOTS:-3}
 MAX_SHIFT_MIN=${MAX_SHIFT_MIN:-120}
+CLAUDE_CALL_TIMEOUT=${CLAUDE_CALL_TIMEOUT:-300}   # claude -p 호출당 최대 5분
+OPTIMIZER_MAX_AGE=${OPTIMIZER_MAX_AGE:-7200}       # 스크립트 총 실행 한도 2시간
+OPTIMIZER_START_TS=$(date +%s)
 
 mkdir -p "$(dirname "$CHANGE_LOG")" "$(dirname "$PHASE_FILE")" "$(dirname "$CANDY_MORNING_TS_FILE")"
 
@@ -476,9 +479,26 @@ sys.exit(1)
 PYEOF
 )
 
-    local attempt result raw_out
+    local attempt result raw_out tmp_out claude_pid killer_pid elapsed
+    tmp_out=$(mktemp)
     for attempt in 1 2 3; do
-        raw_out=$(claude -p --model haiku --output-format json "$prompt" 2>&1) || true
+        # 총 실행 시간 초과 체크
+        elapsed=$(( $(date +%s) - OPTIMIZER_START_TS ))
+        if [ "$elapsed" -gt "$OPTIMIZER_MAX_AGE" ]; then
+            log_change "ERROR: 총 실행 시간 ${elapsed}초 초과 (한도 ${OPTIMIZER_MAX_AGE}초). Claude 호출 포기."
+            rm -f "$tmp_out"
+            return 1
+        fi
+
+        # claude -p 호출 + per-call timeout
+        claude -p --model haiku --output-format json "$prompt" > "$tmp_out" 2>&1 &
+        claude_pid=$!
+        ( sleep "$CLAUDE_CALL_TIMEOUT" && kill -TERM "$claude_pid" 2>/dev/null ) &
+        killer_pid=$!
+        wait "$claude_pid" 2>/dev/null || true
+        kill "$killer_pid" 2>/dev/null || true
+        wait "$killer_pid" 2>/dev/null || true
+        raw_out=$(cat "$tmp_out")
 
         if [ -n "${CLAUDE_RAW_DEBUG_DIR:-}" ]; then
             mkdir -p "$CLAUDE_RAW_DEBUG_DIR"
@@ -495,6 +515,7 @@ PYEOF
 
         if [ -n "$result" ]; then
             printf '%s' "$result"
+            rm -f "$tmp_out"
             return 0
         fi
 
@@ -503,6 +524,7 @@ PYEOF
         log_change "WARN: JSON 파싱 실패 (attempt $attempt/3). Raw: $preview"
         [ "$attempt" -lt 3 ] && sleep 10
     done
+    rm -f "$tmp_out"
 }
 
 # Hard constraint: pre-warm ∈ (WORK_START - 5h, WORK_START]
@@ -608,26 +630,39 @@ PYEOF
 }
 
 # 다음 적용 날짜의 HH:MM → epoch timestamp 계산
+# DOW 파라미터는 더 이상 사용하지 않음: 스크립트 시작 시각과 Claude 응답 시각이
+# 날짜를 넘어갈 수 있으므로, 호출 시점의 today.isoweekday()로 다음 평일을 계산.
 compute_morning_ts() {
-    local h="$1" m="$2" dow="$3"
-    H="$h" M="$m" DOW="$dow" python3 << 'PYEOF'
-import datetime, os
+    local h="$1" m="$2"
+    H="$h" M="$m" python3 << 'PYEOF'
+import datetime, os, time
 from candy_time import get_today
 
 today = get_today()
-dow = int(os.environ["DOW"])
 h = int(os.environ["H"])
 m = int(os.environ["M"])
 
-# 금요일(5)이면 다음 월요일, 아니면 내일
-if dow == 5:
-    days_ahead = 3  # 월요일
-else:
+# 호출 시점의 요일 기준 (1=월 ... 7=일)
+weekday = today.isoweekday()
+if weekday >= 5:   # 금(5)/토(6)/일(7) → 다음 월요일
+    days_ahead = 8 - weekday
+else:              # 월~목 → 내일
     days_ahead = 1
 
 next_date = today + datetime.timedelta(days=days_ahead)
 dt = datetime.datetime.combine(next_date, datetime.time(h, m))
-print(int(dt.timestamp()))
+result_ts = int(dt.timestamp())
+
+# 안전장치: 4일 초과면 경고 후 내일로 클램프
+now_ts = int(time.time())
+if result_ts - now_ts > 4 * 86400:
+    import sys
+    print(f"WARN: morning_ts가 {(result_ts - now_ts)//86400}일 후로 설정됨 — 내일로 클램프", file=sys.stderr)
+    fallback = today + datetime.timedelta(days=1)
+    dt = datetime.datetime.combine(fallback, datetime.time(h, m))
+    result_ts = int(dt.timestamp())
+
+print(result_ts)
 PYEOF
 }
 
@@ -744,7 +779,7 @@ print(hist_monday.isoformat(), (hist_monday + datetime.timedelta(days=4)).isofor
     shift_min=$(echo "$validated" | sed -n '3p')
 
     local new_morning_ts
-    new_morning_ts=$(compute_morning_ts "$new_h" "$new_m" "$dow")
+    new_morning_ts=$(compute_morning_ts "$new_h" "$new_m")
 
     local new_morning_str
     new_morning_str=$(printf '%02d:%02d' "$new_h" "$new_m")
