@@ -149,6 +149,17 @@ progress_rows = [r for r in recent if r.get('type') == 'progress']
 print(f"대상 날짜: {target}, final snapshot {len(snapshot_rows)}개, progress {len(progress_rows)}개")
 
 slot_order = ["1h", "2h", "3h", "4h", "final"]
+# 각 slot 의 윈도우 시작 기준 분 offset (final 은 윈도우 종료 -3분 ≈ 297분)
+slot_offset_min = {"1h": 60, "2h": 120, "3h": 180, "4h": 240, "final": 297}
+
+def _offset_label(off):
+    if off == 0:   return "0"
+    if off == 60:  return "1h"
+    if off == 120: return "2h"
+    if off == 180: return "3h"
+    if off == 240: return "4h"
+    if off == 297: return "final"
+    return f"{off}m"
 window_usage = defaultdict(lambda: {
     "snapshot": [],
     "flows": defaultdict(list),
@@ -199,8 +210,28 @@ for label in sorted(window_usage.keys()):
         print(f"윈도우 {label}: 최종 {final_avg:.0f}% (n={len(snapshot_pcts)})")
 
     flow_parts = []
+    delta_parts = []
     threshold_80 = None
     threshold_90 = None
+    max_delta = None
+    max_segment = None
+    prev_avg = 0.0
+    prev_offset = 0  # 직전에 사용 가능한 데이터가 있던 slot 의 offset (없으면 윈도우 시작)
+
+    # label "HH:MM-HH:MM" 에서 윈도우 시작 분 파싱 (자정 cross 대비 mod 24)
+    try:
+        start_str = label.split("-")[0]
+        sh, sm = (int(x) for x in start_str.split(":"))
+        window_start_min = sh * 60 + sm
+    except Exception:
+        window_start_min = None
+
+    def _fmt_clock(min_offset):
+        if window_start_min is None:
+            return "?"
+        total = (window_start_min + min_offset) % (24 * 60)
+        return f"{total // 60:02d}:{total % 60:02d}"
+
     for slot in slot_order:
         values = data["flows"].get(slot, [])
         if not values:
@@ -213,8 +244,25 @@ for label in sorted(window_usage.keys()):
         if threshold_90 is None and avg >= 90:
             threshold_90 = slot
 
+        cur_offset = slot_offset_min[slot]
+        seg = f"{_offset_label(prev_offset)}-{_offset_label(cur_offset)}"
+        seg_start_clock = _fmt_clock(prev_offset)
+        seg_end_clock   = _fmt_clock(cur_offset)
+        delta = avg - prev_avg
+        delta_parts.append(f"{seg}({seg_start_clock}-{seg_end_clock})={delta:+.0f}%p")
+        if max_delta is None or delta > max_delta:
+            max_delta = delta
+            max_segment = (seg, seg_start_clock, seg_end_clock)
+        prev_avg = avg
+        prev_offset = cur_offset
+
     if flow_parts:
         print("흐름: " + ", ".join(flow_parts))
+    if delta_parts:
+        print("구간별 증가: " + ", ".join(delta_parts))
+    if max_segment and max_delta is not None:
+        seg, ss, ee = max_segment
+        print(f"최대 증가 구간: {seg}({ss}-{ee}) {max_delta:+.0f}%p ← 실제 피크 한복판")
 
     metrics = []
     if threshold_80:
@@ -340,9 +388,11 @@ candy 의 목적은 **토큰 사용량 피크를 단일 5시간 윈도우에 가
 ## 데이터 읽는 법
 - "윈도우 07:24-12:23: 최종 91%" = 그 윈도우가 만료 직전에 91% 소진됨
 - "흐름: 1h=18%, 2h=47%, 3h=68%, 4h=100%(limit carry)" = 같은 윈도우의 누적 진행률
+- "구간별 증가: 0-1h(07:24-08:24)=+18%p, 1h-2h(08:24-09:24)=+29%p, ..." = 각 1시간 구간에서 *실제로* 늘어난 사용량 (절대 시각 포함)
+- "최대 증가 구간: 2h-3h(09:24-10:24) +21%p ← 실제 피크 한복판" = **이 시간대가 진짜 피크**. 라벨이 아니라 이 절대 시각의 정중앙으로 reset_N 을 꽂는다.
+- ⚠️ 윈도우 라벨(예: 22:00-03:00)의 한가운데가 아니라, **"최대 증가 구간"의 한가운데**가 진짜 피크다. 라벨 끝점에 속지 마라.
 - 높은 최종 % = 해당 윈도우 시간대에 토큰 폭주 = **분산 후보**
 - limit carry가 붙으면 그 시점 이후는 사실상 이미 한도 소진 상태 → 그 시점 직전이 피크 한복판
-- 흐름 곡선의 기울기가 가장 가파른 구간이 실제 폭주 시간대
 
 ## 사용자 프로필
 - 매일 ${ws_label} 출근, Claude Code 세션 시작
