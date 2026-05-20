@@ -189,17 +189,17 @@ scenario_optimizer_morning_ts() {
 
     local fake_now target_date
     fake_now=$(ts_of "2026-04-21T23:00:00")  # 화요일 23:00 (DOW=2)
-    target_date="2026-04-20"                   # 어제 = 월요일
+    target_date="2026-04-21"                   # today = 화요일
 
     # 2개 snapshot (MIN_SNAPSHOTS=3 미만 → skip 확인)
-    append_csv_row "{\"timestamp\":1776650400,\"datetime\":\"$target_date 10:58:00\",\"dow\":0,\"hour\":10,\"type\":\"snapshot\",\"sample_slot\":\"final\",\"5h_used_pct\":40,\"5h_resets_at\":1776657600,\"effective_5h_used_pct\":40,\"progress_source\":\"raw\"}"
-    append_csv_row "{\"timestamp\":1776668400,\"datetime\":\"$target_date 15:58:00\",\"dow\":0,\"hour\":15,\"type\":\"snapshot\",\"sample_slot\":\"final\",\"5h_used_pct\":65,\"5h_resets_at\":1776675600,\"effective_5h_used_pct\":65,\"progress_source\":\"raw\"}"
+    append_csv_row "{\"timestamp\":1776736800,\"datetime\":\"$target_date 11:00:00\",\"dow\":2,\"hour\":11,\"type\":\"snapshot\",\"sample_slot\":\"final\",\"5h_used_pct\":40,\"5h_resets_at\":1776744000,\"effective_5h_used_pct\":40,\"progress_source\":\"raw\"}"
+    append_csv_row "{\"timestamp\":1776754800,\"datetime\":\"$target_date 16:00:00\",\"dow\":2,\"hour\":16,\"type\":\"snapshot\",\"sample_slot\":\"final\",\"5h_used_pct\":65,\"5h_resets_at\":1776762000,\"effective_5h_used_pct\":65,\"progress_source\":\"raw\"}"
 
     run_job_script "$fake_now" bash "$TMP_HOME/jobs/bin/schedule_optimizer.sh" >/dev/null
     assert_file_not_exists "$TMP_HOME/jobs/logs/fake_claude.log"
 
     # 3번째 row 추가 → 3개 = MIN_SNAPSHOTS → proceed
-    append_csv_row "{\"timestamp\":1776686400,\"datetime\":\"$target_date 20:58:00\",\"dow\":0,\"hour\":20,\"type\":\"snapshot\",\"sample_slot\":\"final\",\"5h_used_pct\":72,\"5h_resets_at\":1776693600,\"effective_5h_used_pct\":72,\"progress_source\":\"raw\"}"
+    append_csv_row "{\"timestamp\":1776772800,\"datetime\":\"$target_date 21:00:00\",\"dow\":2,\"hour\":21,\"type\":\"snapshot\",\"sample_slot\":\"final\",\"5h_used_pct\":72,\"5h_resets_at\":1776780000,\"effective_5h_used_pct\":72,\"progress_source\":\"raw\"}"
 
     # FAKE_CLAUDE_FILE: time=[7,45] 응답 (retry sleep 없이 바로 성공)
     cat > "$TMP_HOME/jobs/logs/fake_claude_response.ndjson" <<'RESP'

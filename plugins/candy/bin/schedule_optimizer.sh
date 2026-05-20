@@ -125,11 +125,7 @@ if not rows:
 
 rows = [r for r in rows if r.get('type') in ('progress', 'snapshot')]
 
-today = get_today()
-if today.weekday() == 0:
-    target = today - datetime.timedelta(days=3)
-else:
-    target = today - datetime.timedelta(days=1)
+target = get_today()
 
 def _window_date(row):
     try:
@@ -733,11 +729,7 @@ main() {
     log_change "===== OPTIMIZER RUN START ====="
 
     local target_date
-    if [ "$dow" = "1" ]; then
-        target_date=$(runtime_shifted_date -3 '%Y-%m-%d')
-    else
-        target_date=$(runtime_shifted_date -1 '%Y-%m-%d')
-    fi
+    target_date=$(runtime_shifted_date 0 '%Y-%m-%d')
 
     local snap_count=0
     if [ -f "$SNAPSHOT_CSV" ]; then
