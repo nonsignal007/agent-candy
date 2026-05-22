@@ -316,8 +316,14 @@ CHAIN_PYEOF
                     _UID=$(id -u)
                     for _label in com.claude.candy.snapshot com.claude.candy.progress; do
                         _plist_path="$JOBS_ROOT/LaunchAgents/${_label}.plist"
-                        launchctl bootout "gui/${_UID}/${_label}" 2>/dev/null || true
-                        launchctl bootstrap "gui/${_UID}" "$_plist_path" 2>/dev/null || true
+                        _bootout_rc=0
+                        _bootout_out=$(launchctl bootout "gui/${_UID}/${_label}" 2>&1) || _bootout_rc=$?
+                        _bootstrap_rc=0
+                        _bootstrap_out=$(launchctl bootstrap "gui/${_UID}" "$_plist_path" 2>&1) || _bootstrap_rc=$?
+                        if [ "$_bootstrap_rc" -ne 0 ]; then
+                            log "⚠️ launchctl bootstrap 실패 (${_label}, rc=${_bootstrap_rc}): ${_bootstrap_out:-<no output>}"
+                            log "   직전 bootout rc=${_bootout_rc}: ${_bootout_out:-<no output>}"
+                        fi
                     done
                     log "🔗 체인 업데이트 완료: next=$(cat "$CANDY_NEXT_TS_FILE" 2>/dev/null)"
                 else
